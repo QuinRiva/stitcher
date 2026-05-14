@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.installed.cfg
+
+# Virtualenvs / package managers
+.venv/
+venv/
+env/
+.python-version
+poetry.lock
+uv.lock
+
+# Test / coverage / cache
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Agent state — never push
+.pi/
+.claude/
+.agents/
+.roo/
+AGENTS.md.local
+
+# ---------------------------------------------------------------------------
+# Anti-leak safety net: never commit anything that looks like internal data.
+# These patterns exist to catch accidental copy-paste from internal projects.
+# If you genuinely need a file matching these names, rename it.
+# ---------------------------------------------------------------------------
+
+# Internal artefacts — drafts, scratch, private notes
+scratch/
+private/
+internal/
+drafts/
+*.private.*
+*.internal.*
+*.confidential.*
+
+# Fixtures and trace dumps that may carry production data
+fixtures/
+results/
+*.trace.json
+*.langfuse.json
+*_trace_*.json
+trace_*.json
+
+# Project-specific words that should never appear in this OSS repo —
+# tracked here so anyone editing knows the boundary. Files matching
+# these are ignored as a tripwire.
+
+
+
+
