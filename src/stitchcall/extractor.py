@@ -18,20 +18,25 @@ Design rationale: see ``docs/intent.md``.
 from __future__ import annotations
 
 import json
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeAlias
 
 import jsonpatch
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, ValidationError
 
 from stitchcall.exceptions import AggregatedValidationError
 
 
+ValidationContext: TypeAlias = dict[str, Any]
+Callbacks: TypeAlias = list[BaseCallbackHandler]
+
+
 class JsonPatchResponse(BaseModel):
     """Wrapper for the model's JSON Patch repair response."""
 
-    operations: list[dict] = Field(
+    operations: list[dict[str, Any]] = Field(
         ...,
         description=(
             "An RFC 6902 JSON Patch — an array of {op, path, value} operations "
@@ -46,7 +51,7 @@ class Result(NamedTuple):
     value: BaseModel
     attempts: int
     was_re_extracted: bool
-    raw_messages: list
+    raw_messages: list[BaseMessage]
 
 
 _PATCH_PROMPT_TEMPLATE = (
@@ -122,10 +127,10 @@ class Extractor:
 
     async def ainvoke(
         self,
-        messages: list,
+        messages: list[BaseMessage],
         *,
-        validation_context: dict | None = None,
-        callbacks: list | None = None,
+        validation_context: ValidationContext | None = None,
+        callbacks: Callbacks | None = None,
     ) -> Result:
         """Extract a validated instance of ``self.schema`` from ``messages``.
 
@@ -146,19 +151,22 @@ class Extractor:
             RuntimeError: if ``max_attempts`` is exhausted without a valid
                 extraction.
         """
-        original_messages = _coerce_messages(messages)
+        original_messages = list(messages)
         attempts = 0
         was_re_extracted = False
-        raw_messages: list = list(original_messages)
+        raw_messages: list[BaseMessage] = list(original_messages)
 
-        prev_dict: dict | None = None
+        prev_dict: dict[str, Any] | None = None
         last_validation_error: BaseException | None = None
 
         while attempts < self.max_attempts:
             attempts += 1
 
             if prev_dict is None:
-                prev_dict = await self._initial_extract(original_messages, callbacks=callbacks)
+                prev_dict = await self._initial_llm.ainvoke(
+                    original_messages,
+                    config={"callbacks": callbacks or [], "run_name": "stitchcall_initial"},
+                )
                 raw_messages.append(AIMessage(content=json.dumps(prev_dict, default=str)))
             else:
                 patch_msg = HumanMessage(
@@ -221,48 +229,6 @@ class Extractor:
             f"Last validation error: {last_validation_error!r}"
         )
 
-    async def _initial_extract(
-        self, messages: list[BaseMessage], *, callbacks: list | None
-    ) -> dict:
-        out = await self._initial_llm.ainvoke(
-            messages,
-            config={"callbacks": callbacks or [], "run_name": "stitchcall_initial"},
-        )
-        if isinstance(out, BaseModel):
-            return out.model_dump()
-        if not isinstance(out, dict):
-            raise TypeError(
-                f"with_structured_output returned unexpected type: {type(out).__name__}"
-            )
-        return out
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-def _coerce_messages(messages: list) -> list[BaseMessage]:
-    """Accept either dict-form or BaseMessage-form, return BaseMessages."""
-    out: list[BaseMessage] = []
-    for m in messages:
-        if isinstance(m, BaseMessage):
-            out.append(m)
-        elif isinstance(m, dict):
-            role = m.get("role") or m.get("type")
-            content = m.get("content", "")
-            if role == "system":
-                out.append(SystemMessage(content=content))
-            elif role in ("human", "user"):
-                out.append(HumanMessage(content=content))
-            elif role in ("ai", "assistant"):
-                out.append(AIMessage(content=content))
-            else:
-                raise ValueError(f"Unknown message role: {role!r}")
-        else:
-            raise TypeError(f"Unsupported message type: {type(m).__name__}")
-    return out
-
-
 def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""
     total = 0
@@ -276,23 +242,20 @@ def _error_weight(e: ValidationError) -> int:
     return total or 1
 
 
-def _build_patch_prompt(prev_dict: dict, error: BaseException | None) -> str:
+def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) -> str:
     if isinstance(error, ValidationError):
-        try:
-            errors_text = json.dumps(
-                [
-                    {
-                        "loc": list(err.get("loc", [])),
-                        "msg": err.get("msg", ""),
-                        "type": err.get("type", ""),
-                    }
-                    for err in error.errors()
-                ],
-                indent=2,
-                default=str,
-            )
-        except Exception:
-            errors_text = str(error)
+        errors_text = json.dumps(
+            [
+                {
+                    "loc": list(err.get("loc", [])),
+                    "msg": err.get("msg", ""),
+                    "type": err.get("type", ""),
+                }
+                for err in error.errors()
+            ],
+            indent=2,
+            default=str,
+        )
     else:
         errors_text = str(error) if error else "(no error captured)"
     previous_text = json.dumps(prev_dict, indent=2, default=str)

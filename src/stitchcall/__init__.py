@@ -3,7 +3,13 @@
 Trust the model to be mostly right. Stitch the gaps.
 """
 from stitchcall.exceptions import AggregatedValidationError
-from stitchcall.extractor import Extractor, Result
+from stitchcall.extractor import Callbacks, Extractor, Result, ValidationContext
 
-__all__ = ["Extractor", "Result", "AggregatedValidationError"]
+__all__ = [
+    "Extractor",
+    "Result",
+    "AggregatedValidationError",
+    "ValidationContext",
+    "Callbacks",
+]
 __version__ = "0.0.1"
