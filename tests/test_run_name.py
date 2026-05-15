@@ -40,7 +40,7 @@ async def test_run_name_threads_to_initial_call(fake_llm):
 
     assert result.value == Person(name="Alice", age=30)
     assert len(fake_llm.initial_runnable.calls) == 1
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "my-pipeline.extract_person.initial"
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "my-pipeline.extract_person"
 
 
 async def test_run_name_threads_to_patch_calls(fake_llm):
@@ -58,15 +58,16 @@ async def test_run_name_threads_to_patch_calls(fake_llm):
 
     assert result.value == Person(name="Bob", age=7)
     assert result.attempts == 3  # initial + 2 patches
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "batch_42.initial"
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "batch_42"
     assert len(fake_llm.patch_runnable.calls) == 2
     for call in fake_llm.patch_runnable.calls:
         assert call["config"]["run_name"] == "batch_42.patch"
 
 
 async def test_run_name_default_when_unset(fake_llm):
-    """When ``run_name`` is not provided, falls back to ``stitcher_initial`` /
-    ``stitcher_patch`` for backwards compatibility."""
+    """When ``run_name`` is not provided, the base name defaults to
+    ``stitcher``: initial extract is ``stitcher`` (bare), patch turns are
+    ``stitcher.patch``."""
     fake_llm.set_scripts(
         initial=[{"name": "Carol", "age": -1}],
         patch=[
@@ -78,5 +79,5 @@ async def test_run_name_default_when_unset(fake_llm):
     result = await extractor.ainvoke([])
 
     assert result.value == Person(name="Carol", age=99)
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "stitcher_initial"
-    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitcher_patch"
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "stitcher"
+    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitcher.patch"

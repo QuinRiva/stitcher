@@ -37,7 +37,6 @@ from collections.abc import Awaitable
 from typing import Any, Callable, NamedTuple, TypeAlias
 
 import jsonpatch
-from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, ValidationError
@@ -46,7 +45,6 @@ from stitcher.exceptions import AggregatedValidationError
 
 
 ValidationContext: TypeAlias = dict[str, Any]
-Callbacks: TypeAlias = list[BaseCallbackHandler]
 
 
 class AttemptInfo(NamedTuple):
@@ -204,15 +202,13 @@ class Extractor:
         messages: list[BaseMessage],
         *,
         validation_context: ValidationContext | None = None,
-        callbacks: Callbacks | None = None,
         run_name: str | None = None,
+        **config: Any,
     ) -> Result:
         """Extract a validated instance of ``self.schema`` from ``messages``.
 
         Args:
-            messages: conversation history to send to the model. Accepts either
-                LangChain ``BaseMessage`` instances or plain ``{role, content}``
-                dicts (with role in ``system | human | user | ai | assistant``).
+            messages: conversation history to send to the model.
             validation_context: passed to ``schema.model_validate(...,
                 context=...)`` on every validation pass, with one
                 stitcher-supplied key merged in: ``attempt_count`` (1 on
@@ -220,11 +216,19 @@ class Extractor:
                 keys override on collision (matches trustcall's contract).
                 Use this for any cross-field invariants the schema's
                 validators need.
-            callbacks: LangChain callback handlers, threaded into every LLM call
-                (initial extract, every patch turn).
-            run_name: optional prefix for internal LLM run names
-                (``<prefix>.initial`` / ``<prefix>.patch``). Defaults to
-                ``stitcher_initial`` / ``stitcher_patch`` when unset.
+            run_name: optional run name. The initial extract uses this
+                value verbatim (or ``"stitcher"`` when unset); patch turns
+                append ``.patch`` so retries are distinguishable in traces.
+                Use this to differentiate per-call-site traces in tools
+                like Langfuse.
+            **config: forwarded verbatim to LangChain's ``RunnableConfig``
+                on every LLM call (initial extract, every patch turn).
+                Common fields: ``callbacks=[handler, ...]`` for trace
+                handlers, ``tags=["batch_42", ...]`` for trace filtering,
+                ``metadata={"trace_id": "...", ...}`` for trace context.
+                See LangChain's ``RunnableConfig`` for the full list.
+                Stitcher does not validate these keys — misspellings will
+                silently no-op.
 
         Returns:
             ``Result(value, attempts, was_re_extracted, raw_messages)``.
@@ -237,7 +241,7 @@ class Extractor:
             original_messages=messages,
             prev_dict=None,
             run_name=run_name,
-            callbacks=callbacks,
+            config=config,
             validation_context=validation_context,
             allow_re_extract=True,
         )
@@ -248,8 +252,8 @@ class Extractor:
         messages: list[BaseMessage],
         *,
         validation_context: ValidationContext | None = None,
-        callbacks: Callbacks | None = None,
         run_name: str | None = None,
+        **config: Any,
     ) -> Result:
         """Apply an update intent to an existing instance.
 
@@ -272,9 +276,10 @@ class Extractor:
                 JSON-serialisable dict (used directly; not copied).
             messages: conversation history carrying the update intent.
             validation_context: as for ``ainvoke``.
-            callbacks: as for ``ainvoke``.
             run_name: as for ``ainvoke``; only the ``.patch`` suffix is used
                 (no initial extract in update mode).
+            **config: as for ``ainvoke`` — forwarded to LangChain's
+                ``RunnableConfig`` on every patch turn.
 
         Returns:
             ``Result``; ``was_re_extracted`` is always ``False``.
@@ -291,7 +296,7 @@ class Extractor:
             original_messages=messages,
             prev_dict=prev_dict,
             run_name=run_name,
-            callbacks=callbacks,
+            config=config,
             validation_context=validation_context,
             allow_re_extract=False,
         )
@@ -302,7 +307,7 @@ class Extractor:
         original_messages: list[BaseMessage],
         prev_dict: dict[str, Any] | None,
         run_name: str | None,
-        callbacks: Callbacks | None,
+        config: dict[str, Any],
         validation_context: ValidationContext | None,
         allow_re_extract: bool,
     ) -> Result:
@@ -322,8 +327,12 @@ class Extractor:
         ``ainvoke`` enables it because only ``ainvoke`` has a fresh-extract
         path to fall back to.
         """
-        initial_run_name = f"{run_name}.initial" if run_name else "stitcher_initial"
-        patch_run_name = f"{run_name}.patch" if run_name else "stitcher_patch"
+        # Initial extract uses the bare base name; patch turns get a `.patch`
+        # suffix so retries are distinguishable in traces. Default base is
+        # `stitcher` when the caller doesn't supply one.
+        base_run_name = run_name or "stitcher"
+        initial_config: dict[str, Any] = {**config, "run_name": base_run_name}
+        patch_config: dict[str, Any] = {**config, "run_name": f"{base_run_name}.patch"}
 
         raw_messages: list[BaseMessage] = list(original_messages)
         attempts = 0
@@ -336,7 +345,7 @@ class Extractor:
             if prev_dict is None:
                 prev_dict = await self._initial_llm.ainvoke(
                     original_messages,
-                    config={"callbacks": callbacks or [], "run_name": initial_run_name},
+                    config=initial_config,
                 )
                 raw_messages.append(AIMessage(content=json.dumps(prev_dict)))
             else:
@@ -344,8 +353,7 @@ class Extractor:
                     prev_dict=prev_dict,
                     patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
                     original_messages=original_messages,
-                    patch_run_name=patch_run_name,
-                    callbacks=callbacks,
+                    patch_config=patch_config,
                     raw_messages=raw_messages,
                 )
                 if patch_error is not None:
@@ -421,8 +429,7 @@ class Extractor:
         prev_dict: dict[str, Any],
         patch_prompt: str,
         original_messages: list[BaseMessage],
-        patch_run_name: str,
-        callbacks: Callbacks | None,
+        patch_config: dict[str, Any],
         raw_messages: list[BaseMessage],
     ) -> tuple[dict[str, Any], BaseException | None]:
         """One patch turn: build the request, call the model, apply the patch.
@@ -445,7 +452,7 @@ class Extractor:
         raw_messages.append(patch_msg)
         patch_resp: JsonPatchResponse = await self._patch_llm.ainvoke(
             patch_history,
-            config={"callbacks": callbacks or [], "run_name": patch_run_name},
+            config=patch_config,
         )
         ops = patch_resp.operations
         raw_messages.append(

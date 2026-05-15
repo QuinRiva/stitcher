@@ -5,7 +5,6 @@ Trust the model to be mostly right. Stitch the gaps.
 from stitcher.exceptions import AggregatedValidationError
 from stitcher.extractor import (
     AttemptInfo,
-    Callbacks,
     Extractor,
     OnAttempt,
     Result,
@@ -19,6 +18,5 @@ __all__ = [
     "AttemptInfo",
     "OnAttempt",
     "ValidationContext",
-    "Callbacks",
 ]
-__version__ = "0.0.6"
+__version__ = "0.0.7"
