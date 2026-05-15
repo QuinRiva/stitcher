@@ -178,7 +178,7 @@ class Extractor:
                 extraction.
         """
         return await self._patch_loop(
-            original_messages=list(messages),
+            original_messages=messages,
             prev_dict=None,
             run_name=run_name,
             callbacks=callbacks,
@@ -232,7 +232,7 @@ class Extractor:
             else existing
         )
         return await self._patch_loop(
-            original_messages=list(messages),
+            original_messages=messages,
             prev_dict=prev_dict,
             run_name=run_name,
             callbacks=callbacks,
@@ -282,7 +282,7 @@ class Extractor:
                     original_messages,
                     config={"callbacks": callbacks or [], "run_name": initial_run_name},
                 )
-                raw_messages.append(AIMessage(content=json.dumps(prev_dict, default=str)))
+                raw_messages.append(AIMessage(content=json.dumps(prev_dict)))
             else:
                 prev_dict, patch_error = await self._run_patch_turn(
                     prev_dict=prev_dict,
@@ -354,7 +354,7 @@ class Extractor:
         """
         patch_msg = HumanMessage(content=patch_prompt)
         patch_history = list(original_messages) + [
-            AIMessage(content=json.dumps(prev_dict, default=str)),
+            AIMessage(content=json.dumps(prev_dict)),
             patch_msg,
         ]
         raw_messages.append(patch_msg)
@@ -364,7 +364,7 @@ class Extractor:
         )
         ops = patch_resp.operations
         raw_messages.append(
-            AIMessage(content=json.dumps({"operations": ops}, default=str))
+            AIMessage(content=json.dumps({"operations": ops}))
         )
         try:
             new_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
@@ -379,13 +379,9 @@ def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""
     total = 0
     for err in e.errors():
-        ctx = err.get("ctx") or {}
-        cause = ctx.get("error") if isinstance(ctx, dict) else None
-        if isinstance(cause, AggregatedValidationError):
-            total += cause.count
-        else:
-            total += 1
-    return total or 1
+        cause = (err.get("ctx") or {}).get("error")
+        total += cause.count if isinstance(cause, AggregatedValidationError) else 1
+    return total
 
 
 def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) -> str:
@@ -396,7 +392,7 @@ def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) 
     — the *what* is in the caller's messages (aupdate's first turn).
     """
     body = _PATCH_PROMPT_TEMPLATE.format(
-        previous=json.dumps(prev_dict, indent=2, default=str),
+        previous=json.dumps(prev_dict, indent=2),
     )
     if error is None:
         return body
@@ -411,7 +407,6 @@ def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) 
                 for err in error.errors()
             ],
             indent=2,
-            default=str,
         )
     else:
         errors_text = str(error)
