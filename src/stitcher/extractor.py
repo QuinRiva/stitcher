@@ -39,7 +39,7 @@ from typing import Any, Callable, NamedTuple, TypeAlias
 import jsonpatch
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from stitcher.exceptions import AggregatedValidationError
 
@@ -90,15 +90,77 @@ OnAttempt: TypeAlias = Callable[["AttemptInfo"], None | Awaitable[None]]
 
 
 class JsonPatchResponse(BaseModel):
-    """Wrapper for the model's JSON Patch repair response."""
+    """Model's response on a patch turn: structured reasoning followed by JSON Patch ops.
 
+    The two-field shape (reasoning then operations) forces a chain-of-thought step
+    before the model emits its operations — same idea as trustcall's ``planned_edits``.
+    Stitcher reads ``operations`` for the patch apply; ``reasoning`` is preserved in
+    ``raw_messages`` for observability but otherwise discarded.
+    """
+
+    reasoning: str = Field(
+        ...,
+        description=(
+            "First, walk through what needs to change and the JSON Patch operations "
+            "needed. For a validation-driven patch: cite each error and the operation "
+            "to heal it. For a user-driven update: explain what the user requested and "
+            "how the patch encodes it. Reason step by step — this grounds the "
+            "operations below."
+        ),
+    )
     operations: list[dict[str, Any]] = Field(
         ...,
         description=(
-            "An RFC 6902 JSON Patch — an array of {op, path, value} operations "
-            "that, when applied to the previous JSON output, will produce a "
-            "JSON object that passes validation."
+            "Then, the RFC 6902 JSON Patch — an array of {op, path, value} entries. "
+            "Operations are applied SEQUENTIALLY: each operates on the state produced "
+            "by the previous one.\n\n"
+            "Key rules:\n"
+            "- `add` is atomic: deliver the COMPLETE final value in one operation. Do "
+            "  NOT add a placeholder (`{}` or `[]`) intending to fill it with later "
+            "  `replace` ops — the placeholder fails validation immediately and the "
+            "  follow-ups have no path to target.\n"
+            "- `replace` requires the path to already exist. If you see `input_value={}` "
+            "  in a validation error, the parent is empty and the field doesn't exist "
+            "  yet — use `add`, not `replace`.\n"
+            "- For multiple `remove`s on the same list, order them HIGHEST-INDEX-FIRST "
+            "  to avoid index shift between sequential applies.\n"
+            "- For appending to a list, use `\"path\": \"/items/-\"`.\n"
+            "- Paths are JSON Pointers: `/items/0` to address the first list item, "
+            "  `/foo/bar` to address a nested object field."
         ),
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "reasoning": "Field 'age' has wrong type ('thirty' string vs int). Replace with parsed int.",
+                    "operations": [{"op": "replace", "path": "/age", "value": 30}],
+                },
+                {
+                    "reasoning": "Item at /items/2 duplicates /items/0; remove the dupe.",
+                    "operations": [{"op": "remove", "path": "/items/2"}],
+                },
+                {
+                    "reasoning": "User requested adding a tax line; append a complete entry as one atomic add.",
+                    "operations": [
+                        {
+                            "op": "add",
+                            "path": "/lines/-",
+                            "value": {"name": "tax", "amount_cents": 825},
+                        }
+                    ],
+                },
+                {
+                    "reasoning": "Three duplicates at /items/2, /items/5, /items/8; remove highest-index-first to keep indices stable.",
+                    "operations": [
+                        {"op": "remove", "path": "/items/8"},
+                        {"op": "remove", "path": "/items/5"},
+                        {"op": "remove", "path": "/items/2"},
+                    ],
+                },
+            ]
+        }
     )
 
 
@@ -110,18 +172,19 @@ class Result(NamedTuple):
     raw_messages: list[BaseMessage]
 
 
-# Body of every patch-turn prompt: state + how-to-patch instruction.
-# The caller's messages own the *what* (extraction prompt for ainvoke,
-# update intent for aupdate); this template owns the *how*.
+# Body of every patch-turn prompt: target schema + current state + pointer to
+# the structured-output schema for the response format and rules. The caller's
+# messages own the *what* (extraction prompt for ainvoke, update intent for
+# aupdate); this template owns the *how*. The detailed format and ops rules
+# live on JsonPatchResponse's field descriptions, where the model sees them
+# as part of the structured-output binding.
 _PATCH_PROMPT_TEMPLATE = (
+    "The patched output must conform to this target schema:\n\n"
+    "<schema>\n{schema}\n</schema>\n\n"
     "<previous>\n{previous}\n</previous>\n\n"
-    "Return a JSON Patch (RFC 6902) — an `operations` array of "
-    "{{op, path, value}} entries — that, when applied to the previous "
-    "output, produces a JSON object that passes validation. "
-    "Common ops: 'add', 'replace', 'remove'. "
-    "Paths are JSON Pointers (e.g. '/items/0' to address the first list item, "
-    "'/items/-' to append). Return ONLY the patch operations; do not echo the "
-    "full object."
+    "Produce a JSON Patch against the previous output that satisfies the "
+    "target schema. Return reasoning then operations — their format and ops "
+    "rules are in the structured-output schema."
 )
 
 # Prepended to the body when stitcher owns the *what* — i.e. when the
@@ -187,9 +250,14 @@ class Extractor:
         # Bind the user's schema as a JSON-schema dict so the structured-output
         # endpoint returns a parsed dict (which we re-validate ourselves with
         # the user-supplied validation context — model_validate via langchain's
-        # built-in path skips that context).
+        # built-in path skips that context). Cache the JSON-schema dict so the
+        # patch prompt can embed it: on patch turns we bind JsonPatchResponse
+        # to the structured output, so the user's schema is no longer in the
+        # API-level constraint and the model needs it inline to know what
+        # shape it's patching toward.
+        self._schema_json = schema.model_json_schema()
         self._initial_llm = llm.with_structured_output(
-            schema=schema.model_json_schema(),
+            schema=self._schema_json,
             method="json_schema",
         )
         self._patch_llm = llm.with_structured_output(
@@ -351,7 +419,9 @@ class Extractor:
             else:
                 prev_dict, patch_error = await self._run_patch_turn(
                     prev_dict=prev_dict,
-                    patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
+                    patch_prompt=_build_patch_prompt(
+                        prev_dict, last_validation_error, self._schema_json
+                    ),
                     original_messages=original_messages,
                     patch_config=patch_config,
                     raw_messages=raw_messages,
@@ -455,8 +525,12 @@ class Extractor:
             config=patch_config,
         )
         ops = patch_resp.operations
+        # Preserve reasoning in raw_messages for observability — it's the
+        # forced chain-of-thought step the model produced before emitting ops.
         raw_messages.append(
-            AIMessage(content=json.dumps({"operations": ops}))
+            AIMessage(content=json.dumps(
+                {"reasoning": patch_resp.reasoning, "operations": ops}
+            ))
         )
         try:
             new_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
@@ -476,14 +550,23 @@ def _error_weight(e: ValidationError) -> int:
     return total
 
 
-def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) -> str:
+def _build_patch_prompt(
+    prev_dict: dict[str, Any],
+    error: BaseException | None,
+    schema_json: dict[str, Any],
+) -> str:
     """Build the patch-turn prompt.
 
     With ``error`` set, prepends the validator-failure prefix — stitcher
     owns the *what* (the validation errors). With ``error=None``, body only
     — the *what* is in the caller's messages (aupdate's first turn).
+
+    The body always embeds ``schema_json`` so the model has the target
+    schema available on the patch turn (where the structured-output
+    binding is on JsonPatchResponse, not the user's schema).
     """
     body = _PATCH_PROMPT_TEMPLATE.format(
+        schema=json.dumps(schema_json, indent=2),
         previous=json.dumps(prev_dict, indent=2),
     )
     if error is None:

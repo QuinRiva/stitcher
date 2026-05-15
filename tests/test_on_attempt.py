@@ -54,8 +54,8 @@ async def test_on_attempt_fires_per_validation_attempt(fake_llm):
     fake_llm.set_scripts(
         initial=[{"name": "Bob", "age": -5}],   # attempt 1: invalid
         patch=[
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -1}]),  # attempt 2: invalid
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 7}]),   # attempt 3: success
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),  # attempt 2: invalid
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),   # attempt 3: success
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5, on_attempt=seen.append)
@@ -77,7 +77,7 @@ async def test_on_attempt_validation_failure_passes_raw_exception(fake_llm):
     seen: list[AttemptInfo] = []
     fake_llm.set_scripts(
         initial=[{"name": "Carol", "age": -5}],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 18}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 18}])],
     )
     extractor = Extractor(fake_llm, Person, on_attempt=seen.append)
 
@@ -99,9 +99,9 @@ async def test_on_attempt_fires_for_patch_apply_failure(fake_llm):
         initial=[{"name": "Dave", "age": -5}],
         patch=[
             # First patch: pointer doesn't exist \u2192 jsonpatch raises
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/nonexistent/field", "value": 1}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/nonexistent/field", "value": 1}]),
             # Second patch: valid recovery
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 25}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 25}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5, on_attempt=seen.append)
@@ -142,7 +142,7 @@ async def test_on_attempt_fires_for_aupdate(fake_llm):
     seen: list[AttemptInfo] = []
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 99}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 99}])],
     )
     extractor = Extractor(fake_llm, Person, on_attempt=seen.append)
 

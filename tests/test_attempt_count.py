@@ -47,8 +47,8 @@ async def test_attempt_count_increments_across_patch_turns(fake_llm):
     fake_llm.set_scripts(
         initial=[{"age": -5}],   # attempt 1: invalid
         patch=[
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -1}]),  # attempt 2: still invalid
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 7}]),   # attempt 3: passes
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),  # attempt 2: still invalid
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),   # attempt 3: passes
         ],
     )
     extractor = Extractor(fake_llm, Recording, max_attempts=5)
@@ -65,7 +65,7 @@ async def test_attempt_count_starts_at_one_for_aupdate(fake_llm):
 
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 25}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 25}])],
     )
     extractor = Extractor(fake_llm, Recording)
 

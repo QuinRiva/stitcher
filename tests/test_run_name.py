@@ -48,8 +48,8 @@ async def test_run_name_threads_to_patch_calls(fake_llm):
     fake_llm.set_scripts(
         initial=[{"name": "Bob", "age": -5}],   # fails validation
         patch=[
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -1}]),  # still fails
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 7}]),   # passes
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),  # still fails
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),   # passes
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5)
@@ -71,7 +71,7 @@ async def test_run_name_default_when_unset(fake_llm):
     fake_llm.set_scripts(
         initial=[{"name": "Carol", "age": -1}],
         patch=[
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 99}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 99}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=3)

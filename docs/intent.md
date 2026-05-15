@@ -258,6 +258,129 @@ to work well for it, *include the JSON Pointer in your error message*.
 Stitcher does not synthesise pointers from validator messages — that
 contract is the user's.
 
+## Writing LLM-friendly validators
+
+The patch loop only works as well as the validation errors it feeds back
+to the model. A bare `ValueError("invalid")` from your validator gives
+the model nothing to act on; a precise error with a JSON Pointer path
+and a hint about the root cause lets the model produce a one-op patch.
+These patterns are not enforced by stitcher — they're guidance for
+schema authors who want the patch loop to converge quickly.
+
+### Include JSON Pointer paths in `model_validator(mode="after")` messages
+
+Field validators (`@field_validator`) get a useful `loc` automatically.
+Model-level validators (`@model_validator(mode="after")`) don't — their
+`loc` is empty because they fire at the model level, not a field level.
+When a model validator finds something wrong, include the JSON Pointer
+in the error message text:
+
+```python
+@model_validator(mode="after")
+def _check_unique(self):
+    seen: dict[str, int] = {}
+    for i, item in enumerate(self.items):
+        if item.id in seen:
+            raise ValueError(
+                f"Duplicate id '{item.id}' at /items/{i} "
+                f"(first seen at /items/{seen[item.id]}). "
+                f"Patch suggestion: 'remove' the duplicate at /items/{i}."
+            )
+        seen[item.id] = i
+    return self
+```
+
+### Aggregate, don't enumerate
+
+If your validator finds N problems, raise one combined error — not N
+separate ones. Pydantic surfaces only the first raised error per
+validator, so enumerating means you lose N-1 problems on each pass and
+the patch loop wastes attempts. When the N errors share a common cause,
+use `AggregatedValidationError(message, count=N)` to declare the true
+weight to the catastrophic-re-extract threshold.
+
+```python
+@model_validator(mode="after")
+def _check_all(self):
+    errors = []
+    for i, item in enumerate(self.items):
+        if item.amount_cents < 0:
+            errors.append(
+                f"Negative amount at /items/{i}/amount_cents: {item.amount_cents}. "
+                f"Patch suggestion: 'replace' with a non-negative integer."
+            )
+    if errors:
+        raise ValueError(" | ".join(errors))
+    return self
+```
+
+### Pre-empt the empty-object anti-pattern with a `mode="before"` validator
+
+When the model needs to add an object to a list, it sometimes returns an
+empty `{}` as a placeholder intending to fill it later — but JSON Patch
+is declarative, not transactional. The placeholder fails Pydantic
+immediately (one "field required" error per missing field) and the
+follow-up `replace` ops have no path to target. The model often retries
+with another `{}`.
+
+Short-circuit by adding a `mode="before"` check on the child model that
+detects sparse input and raises one message including the expected
+shape:
+
+```python
+class Item(BaseModel):
+    id: str
+    name: str
+    active: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_empty(cls, data):
+        if isinstance(data, dict) and len(data) < 2:
+            raise ValueError(
+                "Empty placeholder rejected. The patch `value` must contain "
+                "the COMPLETE object. Required fields: id (str), name (str), "
+                "active (bool). Use a single `add` op with the complete value, "
+                "not an empty placeholder followed by `replace` ops."
+            )
+        return data
+```
+
+### Read `attempt_count` for first-attempt-strict / later-lenient patterns
+
+Stitcher injects `attempt_count: int` into `validation_context` on every
+validation pass (1 on the first, 2 after the first patch, ...). Use it
+for invariants where you want to challenge the model's first answer but
+accept its judgment on retry — prevents infinite repair loops on
+contested judgments while still giving the LLM a chance to reconsider.
+
+```python
+@model_validator(mode="after")
+def _adjudicate(self, info: ValidationInfo):
+    if (
+        info.context["attempt_count"] == 1
+        and self.values_equivalent
+        and self.unresolved_residuals
+    ):
+        raise ValueError(
+            "Marked values_equivalent=True but unresolved_residuals is non-empty. "
+            "Confirm by leaving values_equivalent=True on retry, or update it."
+        )
+    return self
+```
+
+### Avoid `default_factory=list` on required-shape list fields
+
+A subtle Pydantic + Gemini interaction: `Field(default_factory=list)`
+doesn't emit a JSON Schema `default: []`, so the model may treat the
+field as optional. Some models (Gemini in particular) then skip the
+field entirely and put the *next* field's value in its slot, producing
+type-contamination errors that look unrelated to the actual root cause.
+
+- **Bad:** `items: list[Item] = Field(default_factory=list)`
+- **Good:** `items: list[Item] = Field(...)` — the model must explicitly
+  produce `[]`.
+
 ## Empirical evidence
 
 The design was validated against a single non-trivial workload: one

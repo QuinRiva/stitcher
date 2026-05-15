@@ -46,7 +46,7 @@ async def test_aupdate_first_turn_skips_initial_extract(fake_llm):
     it must never call the initial-extract runnable."""
     fake_llm.set_scripts(
         initial=[],  # initial-extract path must NOT be exercised
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 31}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 31}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -67,7 +67,7 @@ async def test_aupdate_first_turn_prompt_has_no_repair_prefix(fake_llm):
     Patch instructions) but no *what* (no validator-failure framing)."""
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 25}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 25}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -77,11 +77,12 @@ async def test_aupdate_first_turn_prompt_has_no_repair_prefix(fake_llm):
     )
 
     # The HumanMessage carrying the patch prompt is the last message in the
-    # sent input — assert it doesn't carry the repair prefix.
+    # sent input — assert it carries the target schema and the prior, but
+    # NOT the repair prefix (no validation failure on aupdate's first turn).
     sent_input = fake_llm.patch_runnable.calls[0]["input"]
     patch_prompt = sent_input[-1].content
+    assert "<schema>" in patch_prompt
     assert "<previous>" in patch_prompt
-    assert "Return a JSON Patch" in patch_prompt
     assert "failed validation" not in patch_prompt
     assert "<errors>" not in patch_prompt
 
@@ -93,9 +94,9 @@ async def test_aupdate_retry_uses_repair_prefix(fake_llm):
         initial=[],
         patch=[
             # First patch: still invalid (age -2 still < 0)
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -2}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -2}]),
             # Second patch: valid
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 18}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 18}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5)
@@ -121,7 +122,7 @@ async def test_aupdate_accepts_pydantic_instance(fake_llm):
     """``existing`` can be a Pydantic instance; it gets ``model_dump``'d."""
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 50}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 50}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -138,8 +139,8 @@ async def test_aupdate_run_name_threads_to_every_patch_turn(fake_llm):
     fake_llm.set_scripts(
         initial=[],
         patch=[
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -1}]),  # still fails
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 7}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),  # still fails
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5)
@@ -160,7 +161,7 @@ async def test_aupdate_run_name_default_when_unset(fake_llm):
     """Without ``run_name``, patch calls fall back to ``stitcher.patch``."""
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 22}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 22}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -175,9 +176,9 @@ async def test_aupdate_exhausts_attempts_and_raises(fake_llm):
         initial=[],
         patch=[
             # Three patches, all leaving age negative → still invalid
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -10}]),
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -20}]),
-            JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": -30}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -10}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -20}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -30}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=3)
@@ -186,3 +187,26 @@ async def test_aupdate_exhausts_attempts_and_raises(fake_llm):
         await extractor.aupdate(existing={"name": "Gina", "age": 30}, messages=[])
 
     assert len(fake_llm.patch_runnable.calls) == 3
+
+
+async def test_aupdate_first_turn_prompt_embeds_target_schema(fake_llm):
+    """The patch prompt embeds the target schema so the model can reason
+    about what shape to patch toward — needed because on patch turns the
+    structured-output binding is JsonPatchResponse (not the user's schema)."""
+    fake_llm.set_scripts(
+        initial=[],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 25}])],
+    )
+    extractor = Extractor(fake_llm, Person)
+
+    await extractor.aupdate(existing={"name": "Hank", "age": 30}, messages=[])
+
+    patch_prompt = fake_llm.patch_runnable.calls[0]["input"][-1].content
+    # Schema content present (Pydantic emits the field names verbatim)
+    assert '"name"' in patch_prompt
+    assert '"age"' in patch_prompt
+    # Wrapped in the <schema> block, not just leaked elsewhere
+    schema_start = patch_prompt.find("<schema>")
+    schema_end = patch_prompt.find("</schema>")
+    assert schema_start < schema_end
+    assert '"name"' in patch_prompt[schema_start:schema_end]

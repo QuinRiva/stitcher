@@ -37,7 +37,7 @@ async def test_tags_forwarded_to_initial_and_patch_turns(fake_llm):
     """``tags=[...]`` reaches both the initial extract and every patch turn."""
     fake_llm.set_scripts(
         initial=[{"name": "Alice", "age": -1}],   # forces a patch turn
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 30}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 30}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -51,7 +51,7 @@ async def test_metadata_forwarded_to_initial_and_patch_turns(fake_llm):
     """``metadata={...}`` reaches both the initial extract and every patch turn."""
     fake_llm.set_scripts(
         initial=[{"name": "Bob", "age": -1}],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 7}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -80,7 +80,7 @@ async def test_run_name_bare_on_initial_suffixed_on_patch_alongside_passthrough(
     suffixed for patch turns; tags/metadata sit alongside on both."""
     fake_llm.set_scripts(
         initial=[{"name": "Dave", "age": -1}],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 18}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 18}])],
     )
     extractor = Extractor(fake_llm, Person)
 
@@ -103,7 +103,7 @@ async def test_aupdate_also_forwards_config(fake_llm):
     """``aupdate`` forwards ``**config`` to its patch turns too."""
     fake_llm.set_scripts(
         initial=[],
-        patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 50}])],
+        patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 50}])],
     )
     extractor = Extractor(fake_llm, Person)
 
