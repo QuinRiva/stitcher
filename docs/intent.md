@@ -258,6 +258,43 @@ to work well for it, *include the JSON Pointer in your error message*.
 Stitcher does not synthesise pointers from validator messages — that
 contract is the user's.
 
+## Stringified-JSON normalisation (automatic)
+
+Before every `model_validate` call, stitcher walks the parsed dict
+guided by the target Pydantic schema and re-parses any string value
+that sits in a non-string structural slot (a slot annotated as
+`BaseModel`, `list[T]`, `dict[K, V]`, etc.). The motivating case is
+Gemini's soft-enforcement of nested object types: a slot typed
+`list[Item]` occasionally receives `["{...}", "{...}"]` instead of
+`[{...}, {...}]`. Without the normaliser, stitcher pays a patch-turn
+round-trip to repair (~$0.09 / ~20s on Gemini per affected run); with
+it, validation passes on the first attempt.
+
+Safe-by-construction: only fires when ALL of:
+
+1. The value is a `str`
+2. The annotation requires a structural type (`BaseModel`, `list[X]`,
+   `dict[K, V]`, or one of those inside a `Union`)
+3. The string starts with `{` or `[` after stripping whitespace
+4. `json.loads` succeeds and the parsed value matches the expected
+   container (`dict` for object slots, `list` for arrays)
+
+Fields legitimately typed `str` are left alone even if the content
+looks like JSON — the schema explicitly allows strings there.
+
+This is the only post-`json.loads` normalisation stitcher applies. It
+was selected after a survey of BAML's Schema-Aligned Parser (whose
+other text-level recoveries are unreachable from a parsed dict) and
+Instructor (which has effectively no normalisation — it delegates to
+Pydantic non-strict mode and retries on failure). Pydantic non-strict
+mode already covers the cheap coercions (`"42"`→`42`, `"true"`→`True`,
+etc.); BAML's lossy recoveries (silently drop bad array items, round
+3.5→4, etc.) are out of scope for stitcher's design.
+
+No opt-out flag is exposed. If a future use case shows a real false
+positive, an opt-out can be added then — for now the safety property
+above makes one premature.
+
 ## Writing LLM-friendly validators
 
 The patch loop only works as well as the validation errors it feeds back

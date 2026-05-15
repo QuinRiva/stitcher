@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import types
 from collections.abc import Awaitable
-from typing import Any, Callable, NamedTuple, TypeAlias
+from typing import Any, Callable, NamedTuple, TypeAlias, Union, get_args, get_origin
 
 import jsonpatch
 from langchain_core.language_models import BaseChatModel
@@ -374,6 +375,12 @@ class Extractor:
             if isinstance(existing, BaseModel)
             else existing
         )
+        # Normalise the seed before the first patch turn so the model's
+        # patch prompt shows the clean shape (otherwise the model would
+        # write JSON Pointer paths against the stringified form, which
+        # then fail to apply). For BaseModel seeds this is a no-op;
+        # for raw dicts it catches Gemini-style stringified-JSON-in-list-slot.
+        prev_dict = _normalise_stringified_json(prev_dict, self.schema)
 
         # Same parent-runnable wrapping as ainvoke — see comment there.
         async def _execute(_input: Any) -> Result:
@@ -460,6 +467,13 @@ class Extractor:
             # contract: user-supplied keys win, so callers can override
             # (typically only useful for testing).
             ctx = {"attempt_count": attempts, **(validation_context or {})}
+            # Normalise common LLM-side malformations before validation —
+            # specifically: stringified-JSON in object/array slots, the
+            # most common Gemini soft-enforcement artefact. Safe-by-
+            # construction (only fires when the slot's annotation is
+            # structural and the parsed shape matches); see
+            # _normalise_stringified_json for the full rule.
+            prev_dict = _normalise_stringified_json(prev_dict, self.schema)
             try:
                 value = self.schema.model_validate(prev_dict, context=ctx)
                 await self._fire_attempt(attempts, prev_dict, None)
@@ -567,6 +581,119 @@ class Extractor:
                 f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
                 "Re-issue a corrected patch against the previous JSON output."
             )
+
+def _normalise_stringified_json(value: Any, annotation: Any) -> Any:
+    """Walk ``value`` against ``annotation``; re-parse stringified-JSON
+    values that sit in non-string structural slots.
+
+    Motivating case: Gemini soft-enforcement on nested object types. A slot
+    typed ``list[Item]`` occasionally receives ``["{...}", "{...}"]`` instead
+    of ``[{...}, {...}]``. Without this helper, Pydantic rejects the strings
+    and stitcher pays a patch-turn round-trip to repair. With it, we re-parse
+    the strings in place and validation passes on the first attempt.
+
+    Safe-by-construction: only fires when ALL of:
+
+    1. ``value`` is a ``str``
+    2. The annotation requires a structural type (``BaseModel`` / ``list[X]``
+       / ``dict[K, V]``, or one of those inside a ``Union``)
+    3. The string starts with ``{`` or ``[`` after stripping whitespace
+    4. ``json.loads`` succeeds and the parsed value matches the expected
+       container type (``dict`` for object-typed slots, ``list`` for arrays)
+
+    Slots whose annotation is ``str`` (or ``Union[str, ...]``) are left alone
+    even if the string content happens to look like JSON — the schema
+    explicitly allows strings there.
+
+    Limitations:
+
+    - Discriminated unions: when ``value`` is a dict and the annotation is
+      ``Union[ModelA, ModelB, ...]``, we recurse into the first non-None
+      member (no discriminator-based dispatch). Worst case we miss
+      normalisation opportunities deeper in; the patch loop catches anything
+      we miss.
+    - ``Annotated[T, ...]`` is not unwrapped explicitly; Pydantic v2 already
+      strips it from ``FieldInfo.annotation`` so this is moot in practice.
+    """
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    # Optional[T] / Union[A, B, ...]
+    if origin is Union or (hasattr(types, "UnionType") and origin is types.UnionType):
+        if isinstance(value, str) and str in args:
+            # Schema explicitly allows strings here; respect that.
+            return value
+        for arg in args:
+            if arg is not type(None):
+                return _normalise_stringified_json(value, arg)
+        return value
+
+    # list[T]
+    if origin is list:
+        item_type = args[0] if args else Any
+        if isinstance(value, str):
+            parsed = _try_parse_json_string(value, list)
+            if parsed is not None:
+                return [_normalise_stringified_json(item, item_type) for item in parsed]
+            return value
+        if isinstance(value, list):
+            return [_normalise_stringified_json(item, item_type) for item in value]
+        return value
+
+    # dict[K, V]
+    if origin is dict:
+        v_type = args[1] if len(args) >= 2 else Any
+        if isinstance(value, str):
+            parsed = _try_parse_json_string(value, dict)
+            if parsed is not None:
+                return {k: _normalise_stringified_json(v, v_type) for k, v in parsed.items()}
+            return value
+        if isinstance(value, dict):
+            return {k: _normalise_stringified_json(v, v_type) for k, v in value.items()}
+        return value
+
+    # BaseModel subclass
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if isinstance(value, str):
+            parsed = _try_parse_json_string(value, dict)
+            if parsed is not None:
+                return _normalise_stringified_json(parsed, annotation)
+            return value
+        if isinstance(value, dict):
+            result = dict(value)  # preserve unknown keys for Pydantic to handle
+            for fname, finfo in annotation.model_fields.items():
+                if fname in result:
+                    result[fname] = _normalise_stringified_json(
+                        result[fname], finfo.annotation
+                    )
+            return result
+        return value
+
+    # Primitive, Any, or unrecognised — leave alone.
+    return value
+
+
+def _try_parse_json_string(s: str, expected_container: type) -> Any | None:
+    """Try ``json.loads(s.strip())``; return the parsed value if it's the
+    expected container type (``dict`` or ``list``), else ``None``.
+
+    Cheap prefix check (must start with ``{`` or ``[``) avoids parsing
+    strings that obviously aren't JSON.
+    """
+    stripped = s.strip()
+    if not stripped:
+        return None
+    expected_char = "{" if expected_container is dict else "["
+    if not stripped.startswith(expected_char):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, expected_container):
+        return None
+    return parsed
+
 
 def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""
