@@ -15,8 +15,8 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, ValidationInfo, model_validator
 
-from stitchcall import Extractor
-from stitchcall.extractor import JsonPatchResponse
+from stitcher import Extractor
+from stitcher.extractor import JsonPatchResponse
 
 
 pytestmark = pytest.mark.asyncio
@@ -74,7 +74,7 @@ async def test_attempt_count_starts_at_one_for_aupdate(fake_llm):
 
 
 async def test_attempt_count_user_override_wins(fake_llm):
-    """User-supplied attempt_count overrides stitchcall's loop counter."""
+    """User-supplied attempt_count overrides stitcher's loop counter."""
     seen: list[int] = []
     Recording = _make_recording_schema(seen)
 

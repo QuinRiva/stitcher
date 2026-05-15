@@ -40,7 +40,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, ValidationError
 
-from stitchcall.exceptions import AggregatedValidationError
+from stitcher.exceptions import AggregatedValidationError
 
 
 ValidationContext: TypeAlias = dict[str, Any]
@@ -82,7 +82,7 @@ _PATCH_PROMPT_TEMPLATE = (
     "full object."
 )
 
-# Prepended to the body when stitchcall owns the *what* — i.e. when the
+# Prepended to the body when stitcher owns the *what* — i.e. when the
 # trigger is an internal validator failure rather than a user-supplied intent.
 _PATCH_REPAIR_PREFIX = (
     "Your previous JSON output failed validation.\n\n"
@@ -107,7 +107,7 @@ class Extractor:
     Example:
         >>> from pydantic import BaseModel
         >>> from langchain_google_genai import ChatGoogleGenerativeAI
-        >>> from stitchcall import Extractor
+        >>> from stitcher import Extractor
         >>>
         >>> class Person(BaseModel):
         ...     name: str
@@ -163,7 +163,7 @@ class Extractor:
                 dicts (with role in ``system | human | user | ai | assistant``).
             validation_context: passed to ``schema.model_validate(...,
                 context=...)`` on every validation pass, with one
-                stitchcall-supplied key merged in: ``attempt_count`` (1 on
+                stitcher-supplied key merged in: ``attempt_count`` (1 on
                 the first validation, 2 after the first patch, ...). User
                 keys override on collision (matches trustcall's contract).
                 Use this for any cross-field invariants the schema's
@@ -172,7 +172,7 @@ class Extractor:
                 (initial extract, every patch turn).
             run_name: optional prefix for internal LLM run names
                 (``<prefix>.initial`` / ``<prefix>.patch``). Defaults to
-                ``stitchcall_initial`` / ``stitchcall_patch`` when unset.
+                ``stitcher_initial`` / ``stitcher_patch`` when unset.
 
         Returns:
             ``Result(value, attempts, was_re_extracted, raw_messages)``.
@@ -270,8 +270,8 @@ class Extractor:
         ``ainvoke`` enables it because only ``ainvoke`` has a fresh-extract
         path to fall back to.
         """
-        initial_run_name = f"{run_name}.initial" if run_name else "stitchcall_initial"
-        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
+        initial_run_name = f"{run_name}.initial" if run_name else "stitcher_initial"
+        patch_run_name = f"{run_name}.patch" if run_name else "stitcher_patch"
 
         raw_messages: list[BaseMessage] = list(original_messages)
         attempts = 0
@@ -396,7 +396,7 @@ def _error_weight(e: ValidationError) -> int:
 def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) -> str:
     """Build the patch-turn prompt.
 
-    With ``error`` set, prepends the validator-failure prefix — stitchcall
+    With ``error`` set, prepends the validator-failure prefix — stitcher
     owns the *what* (the validation errors). With ``error=None``, body only
     — the *what* is in the caller's messages (aupdate's first turn).
     """

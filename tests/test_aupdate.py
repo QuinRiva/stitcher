@@ -23,8 +23,8 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, model_validator
 
-from stitchcall import Extractor
-from stitchcall.extractor import JsonPatchResponse
+from stitcher import Extractor
+from stitcher.extractor import JsonPatchResponse
 
 
 pytestmark = pytest.mark.asyncio
@@ -157,7 +157,7 @@ async def test_aupdate_run_name_threads_to_every_patch_turn(fake_llm):
 
 
 async def test_aupdate_run_name_default_when_unset(fake_llm):
-    """Without ``run_name``, patch calls fall back to ``stitchcall_patch``."""
+    """Without ``run_name``, patch calls fall back to ``stitcher_patch``."""
     fake_llm.set_scripts(
         initial=[],
         patch=[JsonPatchResponse(operations=[{"op": "replace", "path": "/age", "value": 22}])],
@@ -166,7 +166,7 @@ async def test_aupdate_run_name_default_when_unset(fake_llm):
 
     await extractor.aupdate(existing={"name": "Frank", "age": 30}, messages=[])
 
-    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitchcall_patch"
+    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitcher_patch"
 
 
 async def test_aupdate_exhausts_attempts_and_raises(fake_llm):

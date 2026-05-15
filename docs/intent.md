@@ -6,14 +6,14 @@ manager_sessions:
     authored_at: 2026-05-14T12:31:58.797Z
 ---
 
-# Intent: stitchcall
+# Intent: stitcher
 
 A small library for **single-schema** structured LLM extraction with native
 JSON-mode initial extract and JSON-Patch (RFC 6902) repair on validation
 failure, plus a single-instance update primitive (`aupdate`) that reuses
 the same patch loop. Complements [trustcall](https://github.com/hwchase17/trustcall)
 — which remains the right tool for multi-schema, multi-call, and
-multi-instance patch-existing flows. `stitchcall` is for the more common
+multi-instance patch-existing flows. `stitcher` is for the more common
 case where you bind one schema, expect one validated object back, and want
 surgical repair when the model's first try is *almost* right — or where
 you have a single prior instance and want to apply a user-described update
@@ -41,7 +41,7 @@ per trial on Gemini 3 Flash; switching the *same schema* to native JSON
 mode + JSON-Patch repair achieves 100 % success in roughly half the
 wall-time (see "Empirical evidence" below).
 
-## What stitchcall is
+## What stitcher is
 
 An extractor with a small public API — two operations sharing one
 patch-loop mechanism:
@@ -111,7 +111,7 @@ result = await extractor.aupdate(existing=prior,
 
 ### Validation context contract
 
-On every `model_validate` call (in either `ainvoke` or `aupdate`), stitchcall
+On every `model_validate` call (in either `ainvoke` or `aupdate`), stitcher
 merges one library-supplied key into the user's `validation_context`:
 
 - `attempt_count: int` — 1 on the first validation, incrementing by one
@@ -124,12 +124,12 @@ User-supplied keys win on collision — callers can pass
 `validation_context={"attempt_count": 5}` to simulate a later attempt in
 tests, also matching trustcall.
 
-## What stitchcall is **not**
+## What stitcher is **not**
 
 - **Not a replacement for trustcall.** Multi-schema, multi-call, and
   *multi-instance* patch-existing flows belong in trustcall — those flows
   need `tool_call_id` correlation, multi-schema routing, and
-  `ToolMessage`-based history that stitchcall's JSON-mode + HumanMessage
+  `ToolMessage`-based history that stitcher's JSON-mode + HumanMessage
   shape cannot express. **Single-instance** update is supported via
   `aupdate` (see above) because the architectural objection to trustcall's
   flow is specific to the multi-instance case.
@@ -140,7 +140,7 @@ tests, also matching trustcall.
 - **Not a verify-and-repair primitive.** `aupdate` always runs at least
   one LLM call. Callers who want "validate this; only call the model if
   it's broken" should pre-validate with `schema.model_validate(...)` and
-  branch on `ValidationError` themselves — stitchcall does not conflate
+  branch on `ValidationError` themselves — stitcher does not conflate
   the two operations.
 - **Not a tool-calling primitive.** No `bind_tools`, no `tool_choice`, no
   `tool_call_id` correlation, no `ToolMessage`. Single response, repair via
@@ -175,13 +175,13 @@ shape achieves ~3 % success on the same workload where the wrapping shape
 achieves ~80 %.
 
 The lesson: the wrapping schema is **load-bearing for the model's own
-consistency**, not just for validation. Stitchcall preserves it; the
+consistency**, not just for validation. Stitcher preserves it; the
 transport changes, the schema doesn't.
 
 ### 3. JSON Patch (RFC 6902), not custom PatchDoc
 
 Trustcall uses a custom `PatchDoc` schema because it needs `tool_call_id`
-correlation back to the original tool call being patched. Stitchcall has
+correlation back to the original tool call being patched. Stitcher has
 only one extraction in flight, so RFC 6902 with the standard `jsonpatch`
 library is sufficient. No custom primitive needed.
 
@@ -211,9 +211,9 @@ matter. The model uses those pointers verbatim in its `path` operations.
 Without that handover the patch loop would degenerate into "edit the whole
 document".
 
-If you write a custom `model_validator` and want stitchcall's patch loop
+If you write a custom `model_validator` and want stitcher's patch loop
 to work well for it, *include the JSON Pointer in your error message*.
-Stitchcall does not synthesise pointers from validator messages — that
+Stitcher does not synthesise pointers from validator messages — that
 contract is the user's.
 
 ## Empirical evidence
@@ -227,7 +227,7 @@ items, prompted with a ~500k-token user message, run on
 |---|---|---|---|---|
 | trustcall + tools (wrapping schema) | 30 | 80 % (24/30) | 485 | 2.63 |
 | trustcall + tools (flat multi-call) | 30 |  3 % (1/30)  | 268 | 1.90 |
-| **stitchcall** (wrapping schema, JSON mode) | **30** | **100 % (30/30)** | **246** | **1.55** |
+| **stitcher** (wrapping schema, JSON mode) | **30** | **100 % (30/30)** | **246** | **1.55** |
 
 Same fixture, same model, same temperature in all three. The wrapping
 schema is preserved across rows 1 and 3; only the transport (and repair
@@ -250,7 +250,7 @@ Notable findings:
   reserved for genuinely-broken initial extractions and was correctly
   dormant.
 - **Wall-time saved is mostly from avoided retries.** Trustcall's failures
-  consume the full `max_attempts` budget; stitchcall's patch loop converges
+  consume the full `max_attempts` budget; stitcher's patch loop converges
   in 1–3 attempts on every observed case.
 
 ## Migration from trustcall (single-schema call sites)
@@ -271,10 +271,10 @@ response = await extractor.ainvoke({
 my_schema_instance = response["responses"][0]
 ```
 
-The stitchcall equivalent:
+The stitcher equivalent:
 
 ```python
-extractor = stitchcall.Extractor(
+extractor = stitcher.Extractor(
     llm,
     schema=MySchema,
     max_validation_error_weight=40,
@@ -312,7 +312,7 @@ mechanics carry across cleanly.
   a small sibling tool preserves trustcall's value where it is uniquely
   useful (multi-schema, multi-instance patch-existing) and removes its
   overhead where it is not. (Single-instance patch-existing is in scope
-  for stitchcall — see `aupdate` — because the architectural objection
+  for stitcher — see `aupdate` — because the architectural objection
   above is multi-instance-specific.)
 - **Flat multi-call extraction** (`tools=[A, B], tool_choice="any"`).
   Empirically falsified above: 3 % vs 80 % success at fixed schema and

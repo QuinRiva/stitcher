@@ -3,7 +3,7 @@
 These tests do not call any real LLM. ``FakeLLM`` is a hand-rolled
 ``BaseChatModel`` subclass that returns scripted responses, lets each test
 assert on the exact ``config`` (i.e. ``run_name``, ``callbacks``) that
-stitchcall threads through, and counts how many times each underlying call
+stitcher threads through, and counts how many times each underlying call
 was made.
 
 There is no fixture for an Extractor instance because tests typically need
@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 class _ScriptedRunnable(Runnable):
     """A Runnable that returns scripted outputs in order, recording each call's
-    config so tests can assert what stitchcall passed.
+    config so tests can assert what stitcher passed.
 
     Each scripted output is either:
     - a dict (returned as-is — simulates the JSON-mode initial extract path
@@ -42,7 +42,7 @@ class _ScriptedRunnable(Runnable):
         self.calls: list[dict[str, Any]] = []
 
     def invoke(self, input, config=None, **kwargs):  # type: ignore[override]
-        raise AssertionError("stitchcall is async-only; sync invoke shouldn't be used")
+        raise AssertionError("stitcher is async-only; sync invoke shouldn't be used")
 
     async def ainvoke(self, input, config: RunnableConfig | None = None, **kwargs):  # type: ignore[override]
         if not self._script:
@@ -57,13 +57,13 @@ class FakeLLM(BaseChatModel):
     ``_ScriptedRunnable`` instances controlled per-test.
 
     Two scripts are tracked separately, mirroring the two ``with_structured_output``
-    calls stitchcall makes in ``Extractor.__init__``:
+    calls stitcher makes in ``Extractor.__init__``:
 
     - ``initial_script`` \u2192 used by the ``self._initial_llm`` runnable
     - ``patch_script`` \u2192 used by the ``self._patch_llm`` runnable
 
     Tests populate them via ``llm.set_scripts(initial=[...], patch=[...])``
-    *before* constructing the Extractor, since stitchcall captures the
+    *before* constructing the Extractor, since stitcher captures the
     structured-output runnables eagerly in ``__init__``.
     """
 
@@ -81,7 +81,7 @@ class FakeLLM(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=""))])
 
     def with_structured_output(self, schema, *, method=None, **kwargs):  # type: ignore[override]
-        # Distinguish the two stitchcall call sites by schema shape.
+        # Distinguish the two stitcher call sites by schema shape.
         # Initial: ``schema`` is a dict (a JSON Schema). Patch: ``schema`` is
         # the ``JsonPatchResponse`` Pydantic class.
         if isinstance(schema, type) and issubclass(schema, BaseModel):

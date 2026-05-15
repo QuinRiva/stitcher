@@ -4,12 +4,12 @@ from __future__ import annotations
 
 class AggregatedValidationError(ValueError):
     """Raise from inside a Pydantic validator that aggregates N underlying problems
-    into a single error message, to declare the true weight to stitchcall's
+    into a single error message, to declare the true weight to stitcher's
     catastrophic-re-extract threshold.
 
     Example:
         >>> from pydantic import BaseModel, model_validator
-        >>> from stitchcall import AggregatedValidationError
+        >>> from stitcher import AggregatedValidationError
         >>>
         >>> class MyOutput(BaseModel):
         ...     items: list[str]
@@ -24,7 +24,7 @@ class AggregatedValidationError(ValueError):
         ...             )
         ...         return self
 
-    Stitchcall sums the ``count`` of each AggregatedValidationError raised
+    Stitcher sums the ``count`` of each AggregatedValidationError raised
     in a single validation pass; if the total exceeds
     ``max_validation_error_weight``, the patch loop is abandoned and a
     fresh extract is performed instead. Vanilla ``ValueError`` instances

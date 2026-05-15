@@ -1,4 +1,4 @@
-"""Basic stitchcall usage — a simple Person extraction.
+"""Basic stitcher usage — a simple Person extraction.
 
 Run with credentials configured for your chosen LLM provider, e.g.:
 
@@ -14,7 +14,7 @@ import asyncio
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field, model_validator
 
-from stitchcall import AggregatedValidationError, Extractor
+from stitcher import AggregatedValidationError, Extractor
 
 
 class Person(BaseModel):
