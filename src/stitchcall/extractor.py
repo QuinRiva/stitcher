@@ -1,6 +1,8 @@
 """Extractor — single-schema LLM extraction with native JSON-mode + JSON-Patch repair.
 
-Pipeline per ``ainvoke``:
+Two public operations, both built on the same JSON-Patch repair loop:
+
+``ainvoke(messages, ...)`` — produce a fresh validated instance:
 
     1. Initial extract via the model's native JSON mode
        (``with_structured_output(method="json_schema")``). Returns a parsed dict.
@@ -12,6 +14,18 @@ Pipeline per ``ainvoke``:
        - else: ask the model for a JSON Patch (RFC 6902) on a plain
          ``HumanMessage`` chain, apply via ``jsonpatch``, re-validate.
     4. Bounded by ``max_attempts``.
+
+``aupdate(existing, messages, ...)`` — transform an existing instance per user
+intent (replaces trustcall's ``existing=`` flow for the single-schema case):
+
+    1. Seed ``prev_dict`` from ``existing``; skip the initial extract.
+    2. Patch loop runs as in ``ainvoke``. The first turn carries no validator
+       header — the user's update intent in ``messages`` directs *what* to
+       patch; the prompt only specifies *how* (JSON Patch / JSON Pointer
+       format). Subsequent turns (if validation fails) prepend the validation
+       header exactly as in ``ainvoke``.
+    3. No catastrophic-re-extract path (there is no fresh-extract fallback);
+       bounded by ``max_attempts``.
 
 Design rationale: see ``docs/intent.md``.
 """
@@ -47,17 +61,17 @@ class JsonPatchResponse(BaseModel):
 
 
 class Result(NamedTuple):
-    """Result of a successful ``Extractor.ainvoke`` call."""
+    """Result of a successful ``ainvoke`` or ``aupdate`` call."""
     value: BaseModel
     attempts: int
     was_re_extracted: bool
     raw_messages: list[BaseMessage]
 
 
+# Body of every patch-turn prompt: state + how-to-patch instruction.
+# The caller's messages own the *what* (extraction prompt for ainvoke,
+# update intent for aupdate); this template owns the *how*.
 _PATCH_PROMPT_TEMPLATE = (
-    "Your previous JSON output failed validation.\n\n"
-    "<errors>\n{errors}\n</errors>\n\n"
-    "The previous JSON output was:\n\n"
     "<previous>\n{previous}\n</previous>\n\n"
     "Return a JSON Patch (RFC 6902) — an `operations` array of "
     "{{op, path, value}} entries — that, when applied to the previous "
@@ -66,6 +80,14 @@ _PATCH_PROMPT_TEMPLATE = (
     "Paths are JSON Pointers (e.g. '/items/0' to address the first list item, "
     "'/items/-' to append). Return ONLY the patch operations; do not echo the "
     "full object."
+)
+
+# Prepended to the body when stitchcall owns the *what* — i.e. when the
+# trigger is an internal validator failure rather than a user-supplied intent.
+_PATCH_REPAIR_PREFIX = (
+    "Your previous JSON output failed validation.\n\n"
+    "<errors>\n{errors}\n</errors>\n\n"
+    "The previous JSON output was:\n\n"
 )
 
 
@@ -131,6 +153,7 @@ class Extractor:
         *,
         validation_context: ValidationContext | None = None,
         callbacks: Callbacks | None = None,
+        run_name: str | None = None,
     ) -> Result:
         """Extract a validated instance of ``self.schema`` from ``messages``.
 
@@ -143,6 +166,9 @@ class Extractor:
                 cross-field invariants the schema's validators need.
             callbacks: LangChain callback handlers, threaded into every LLM call
                 (initial extract, every patch turn).
+            run_name: optional prefix for internal LLM run names
+                (``<prefix>.initial`` / ``<prefix>.patch``). Defaults to
+                ``stitchcall_initial`` / ``stitchcall_patch`` when unset.
 
         Returns:
             ``Result(value, attempts, was_re_extracted, raw_messages)``.
@@ -151,6 +177,9 @@ class Extractor:
             RuntimeError: if ``max_attempts`` is exhausted without a valid
                 extraction.
         """
+        initial_run_name = f"{run_name}.initial" if run_name else "stitchcall_initial"
+        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
+
         original_messages = list(messages)
         attempts = 0
         was_re_extracted = False
@@ -165,35 +194,22 @@ class Extractor:
             if prev_dict is None:
                 prev_dict = await self._initial_llm.ainvoke(
                     original_messages,
-                    config={"callbacks": callbacks or [], "run_name": "stitchcall_initial"},
+                    config={"callbacks": callbacks or [], "run_name": initial_run_name},
                 )
                 raw_messages.append(AIMessage(content=json.dumps(prev_dict, default=str)))
             else:
-                patch_msg = HumanMessage(
-                    content=_build_patch_prompt(prev_dict, last_validation_error)
+                prev_dict, patch_error = await self._run_patch_turn(
+                    prev_dict=prev_dict,
+                    patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
+                    original_messages=original_messages,
+                    patch_run_name=patch_run_name,
+                    callbacks=callbacks,
+                    raw_messages=raw_messages,
                 )
-                patch_history = list(original_messages) + [
-                    AIMessage(content=json.dumps(prev_dict, default=str)),
-                    patch_msg,
-                ]
-                raw_messages.append(patch_msg)
-                patch_resp: JsonPatchResponse = await self._patch_llm.ainvoke(
-                    patch_history,
-                    config={"callbacks": callbacks or [], "run_name": "stitchcall_patch"},
-                )
-                ops = patch_resp.operations
-                raw_messages.append(
-                    AIMessage(content=json.dumps({"operations": ops}, default=str))
-                )
-                try:
-                    prev_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
-                except (jsonpatch.JsonPatchException, jsonpatch.JsonPointerException) as e:
-                    # Treat patch-application failure as a validation failure for
-                    # the next loop turn — feed the error back to the model.
-                    last_validation_error = ValueError(
-                        f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
-                        "Re-issue a corrected patch against the previous JSON output."
-                    )
+                if patch_error is not None:
+                    # Patch couldn't be applied — feed the error back to the
+                    # model on the next turn.
+                    last_validation_error = patch_error
                     continue
 
             try:
@@ -229,6 +245,140 @@ class Extractor:
             f"Last validation error: {last_validation_error!r}"
         )
 
+    async def aupdate(
+        self,
+        existing: BaseModel | dict[str, Any],
+        messages: list[BaseMessage],
+        *,
+        validation_context: ValidationContext | None = None,
+        callbacks: Callbacks | None = None,
+        run_name: str | None = None,
+    ) -> Result:
+        """Apply an update intent to an existing instance.
+
+        ``messages`` carry the user's update request (the *what*). ``existing``
+        seeds the patch loop directly; the initial JSON-mode extract is
+        skipped. The first patch turn presents the prior with no validator
+        header — the model is expected to read the update intent from the
+        preceding messages. Subsequent turns (if validation fails) are
+        validator-driven exactly as in ``ainvoke``. No catastrophic-re-extract
+        path exists in update mode; ``max_attempts`` exhaustion raises.
+
+        Always runs at least one LLM call. If the existing object is already
+        valid and no update is needed, do not call ``aupdate`` — there is no
+        zero-LLM-call optimisation by design (that would conflate update with
+        verify-and-repair, which are different operations).
+
+        Args:
+            existing: the prior instance — either a Pydantic model instance
+                (``model_dump(mode='json')`` is called internally) or a
+                JSON-serialisable dict (used directly; not copied).
+            messages: conversation history carrying the update intent.
+            validation_context: as for ``ainvoke``.
+            callbacks: as for ``ainvoke``.
+            run_name: as for ``ainvoke``; only the ``.patch`` suffix is used
+                (no initial extract in update mode).
+
+        Returns:
+            ``Result``; ``was_re_extracted`` is always ``False``.
+
+        Raises:
+            RuntimeError: if ``max_attempts`` is exhausted.
+        """
+        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
+
+        original_messages = list(messages)
+        raw_messages: list[BaseMessage] = list(original_messages)
+
+        prev_dict: dict[str, Any] = (
+            existing.model_dump(mode="json")
+            if isinstance(existing, BaseModel)
+            else existing
+        )
+
+        attempts = 0
+        last_validation_error: BaseException | None = None
+
+        while attempts < self.max_attempts:
+            attempts += 1
+
+            # First turn: last_validation_error is None → no repair prefix
+            # → the user's messages own the *what*. Subsequent turns: error
+            # is set → prefix prepended → patch is validator-driven.
+            prev_dict, patch_error = await self._run_patch_turn(
+                prev_dict=prev_dict,
+                patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
+                original_messages=original_messages,
+                patch_run_name=patch_run_name,
+                callbacks=callbacks,
+                raw_messages=raw_messages,
+            )
+            if patch_error is not None:
+                last_validation_error = patch_error
+                continue
+
+            try:
+                value = self.schema.model_validate(prev_dict, context=validation_context)
+                return Result(
+                    value=value,
+                    attempts=attempts,
+                    was_re_extracted=False,
+                    raw_messages=raw_messages,
+                )
+            except (ValidationError, AggregatedValidationError) as e:
+                last_validation_error = e
+                continue
+
+        raise RuntimeError(
+            f"Extractor exhausted {self.max_attempts} attempts in aupdate. "
+            f"Last validation error: {last_validation_error!r}"
+        )
+
+    async def _run_patch_turn(
+        self,
+        *,
+        prev_dict: dict[str, Any],
+        patch_prompt: str,
+        original_messages: list[BaseMessage],
+        patch_run_name: str,
+        callbacks: Callbacks | None,
+        raw_messages: list[BaseMessage],
+    ) -> tuple[dict[str, Any], BaseException | None]:
+        """One patch turn: build the request, call the model, apply the patch.
+
+        Returns ``(new_prev_dict, error)``. On success ``error`` is ``None`` and
+        ``new_prev_dict`` is the patched dict. If the model's patch can't be
+        applied (malformed op, bad pointer, etc.), ``new_prev_dict`` is the
+        *unchanged* input and ``error`` carries a synthetic ``ValueError``
+        the caller should feed back to the next turn as the validation
+        trigger.
+
+        Mutates ``raw_messages`` in place (appends the outgoing
+        ``HumanMessage`` and the model's ``AIMessage``).
+        """
+        patch_msg = HumanMessage(content=patch_prompt)
+        patch_history = list(original_messages) + [
+            AIMessage(content=json.dumps(prev_dict, default=str)),
+            patch_msg,
+        ]
+        raw_messages.append(patch_msg)
+        patch_resp: JsonPatchResponse = await self._patch_llm.ainvoke(
+            patch_history,
+            config={"callbacks": callbacks or [], "run_name": patch_run_name},
+        )
+        ops = patch_resp.operations
+        raw_messages.append(
+            AIMessage(content=json.dumps({"operations": ops}, default=str))
+        )
+        try:
+            new_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
+            return new_dict, None
+        except (jsonpatch.JsonPatchException, jsonpatch.JsonPointerException) as e:
+            return prev_dict, ValueError(
+                f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
+                "Re-issue a corrected patch against the previous JSON output."
+            )
+
 def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""
     total = 0
@@ -243,6 +393,17 @@ def _error_weight(e: ValidationError) -> int:
 
 
 def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) -> str:
+    """Build the patch-turn prompt.
+
+    With ``error`` set, prepends the validator-failure prefix — stitchcall
+    owns the *what* (the validation errors). With ``error=None``, body only
+    — the *what* is in the caller's messages (aupdate's first turn).
+    """
+    body = _PATCH_PROMPT_TEMPLATE.format(
+        previous=json.dumps(prev_dict, indent=2, default=str),
+    )
+    if error is None:
+        return body
     if isinstance(error, ValidationError):
         errors_text = json.dumps(
             [
@@ -257,6 +418,5 @@ def _build_patch_prompt(prev_dict: dict[str, Any], error: BaseException | None) 
             default=str,
         )
     else:
-        errors_text = str(error) if error else "(no error captured)"
-    previous_text = json.dumps(prev_dict, indent=2, default=str)
-    return _PATCH_PROMPT_TEMPLATE.format(errors=errors_text, previous=previous_text)
+        errors_text = str(error)
+    return _PATCH_REPAIR_PREFIX.format(errors=errors_text) + body

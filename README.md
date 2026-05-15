@@ -9,10 +9,12 @@ output fails Pydantic validation — repairing only the parts that are wrong
 instead of regenerating the whole object.
 
 It complements [trustcall](https://github.com/hwchase17/trustcall): trustcall
-handles tool-calling, multi-schema, and patch-existing-instances flows;
-`stitchcall` handles the more common "give me one Pydantic-validated object,
-and please patch it if it's broken" case with a smaller surface and (in our
-testing) a higher success rate at lower wall time on weaker models.
+handles tool-calling, multi-schema, and *multi-instance* patch flows
+(`existing={id1: ..., id2: ...}` keyed by `tool_call_id`); `stitchcall`
+handles the more common single-schema cases — "give me one Pydantic-validated
+object, and please patch it if it's broken" (`ainvoke`) and "apply this
+update to one existing instance" (`aupdate`) — with a smaller surface and
+(in our testing) a higher success rate at lower wall time on weaker models.
 
 ## Install
 
@@ -85,15 +87,42 @@ history-compatibility constraints of providers like Gemini.
 
 | Use case | Tool |
 |---|---|
-| Single Pydantic schema, single response, JSON-Patch repair | **stitchcall** |
+| Single Pydantic schema, single response, JSON-Patch repair | **stitchcall** (`ainvoke`) |
+| Update a single existing instance per a user intent | **stitchcall** (`aupdate`) |
 | Multiple schemas, model decides which to call | **trustcall** |
 | Multi-call extraction (one schema, N invocations) | **trustcall** |
-| Patch existing instances (`existing=…`) | **trustcall** |
+| Patch *multiple* existing instances in one call (`existing=…` keyed by `tool_call_id`) | **trustcall** |
 | Tool calling as part of an agent loop (not extraction) | LangChain / LangGraph directly |
 
 If you only ever bind one schema with `tool_choice="<that schema name>"`,
 `stitchcall` does the same job with less surface area and avoids the
 duplicate-tool-call class of failures that comes with tool-mode binding.
+
+## Updating an existing instance
+
+`aupdate` patches a prior instance per a user intent expressed in messages.
+The initial JSON-mode extract is skipped — the existing instance seeds the
+patch loop directly:
+
+```python
+from langchain_core.messages import SystemMessage, HumanMessage
+
+current_invoice = Invoice(supplier="Acme", line_items=["widget"], total_cents=1500)
+
+result = await extractor.aupdate(
+    existing=current_invoice,
+    messages=[
+        SystemMessage(content="You modify invoice records."),
+        HumanMessage(content="Add a line item 'shipping' worth 250 cents."),
+    ],
+)
+print(result.value)        # Invoice with the new line item, validated
+print(result.attempts)     # patch turns until validation passed
+```
+
+The first turn asks the model for a JSON Patch driven by the user's intent;
+subsequent turns (if validation fails) are validator-driven exactly as in
+`ainvoke`.
 
 ## Design rationale
 

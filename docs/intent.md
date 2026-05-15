@@ -10,11 +10,14 @@ manager_sessions:
 
 A small library for **single-schema** structured LLM extraction with native
 JSON-mode initial extract and JSON-Patch (RFC 6902) repair on validation
-failure. Complements [trustcall](https://github.com/hwchase17/trustcall) —
-which remains the right tool for multi-schema, multi-call, and
-patch-existing-instances flows. `stitchcall` is for the more common case
-where you bind one schema, expect one validated object back, and want
-surgical repair when the model's first try is *almost* right.
+failure, plus a single-instance update primitive (`aupdate`) that reuses
+the same patch loop. Complements [trustcall](https://github.com/hwchase17/trustcall)
+— which remains the right tool for multi-schema, multi-call, and
+multi-instance patch-existing flows. `stitchcall` is for the more common
+case where you bind one schema, expect one validated object back, and want
+surgical repair when the model's first try is *almost* right — or where
+you have a single prior instance and want to apply a user-described update
+to it.
 
 ## Why this exists
 
@@ -40,19 +43,31 @@ wall-time (see "Empirical evidence" below).
 
 ## What stitchcall is
 
-A `~250-line` extractor with a small public API:
+An extractor with a small public API — two operations sharing one
+patch-loop mechanism:
 
 ```python
 extractor = Extractor(llm, MySchema, max_attempts=5,
                       max_validation_error_weight=40)
+
+# Operation A: produce a fresh validated instance
 result = await extractor.ainvoke(messages,
                                  validation_context={...},
-                                 callbacks=[...])
+                                 callbacks=[...],
+                                 run_name="my_call_site")
+
+# Operation B: transform a prior instance per a user intent
+result = await extractor.aupdate(existing=prior,
+                                 messages=messages,
+                                 validation_context={...},
+                                 callbacks=[...],
+                                 run_name="my_call_site")
+
 # result.value : MySchema (validated)
 # result.attempts, result.was_re_extracted, result.raw_messages
 ```
 
-It does exactly four things:
+`ainvoke` does exactly four things:
 
 1. **Initial extract via native JSON mode.**
    `llm.with_structured_output(schema=MySchema.model_json_schema(),
@@ -71,10 +86,47 @@ It does exactly four things:
    `AggregatedValidationError(count=N)` so user validators can declare
    "this single error covers N underlying problems".
 
+`aupdate` reuses the patch loop with a different first-turn shape:
+
+1. **Skip the initial extract**; seed `prev_dict` from `existing`
+   (`model_dump(mode="json")` for Pydantic instances, the dict directly
+   for raw dicts — jsonpatch returns a fresh object on apply, so no copy
+   is needed).
+2. **First patch turn carries no validator framing.** The prior is presented
+   to the model and the same patch-instruction template as `ainvoke`'s
+   repair turn is used — minus the `<errors>` prefix. The user's update
+   intent in `messages` directs *what* to patch; the prompt only specifies
+   *how* (JSON Patch / JSON Pointer format). Schema stays on the
+   `with_structured_output` binding, as usual — not stuffed into the
+   prompt.
+3. **Subsequent turns are validator-driven** — the validator-failure
+   prefix is prepended to the same patch template, identical to
+   `ainvoke`'s repair turns.
+4. **Always at least one LLM call.** No zero-LLM-call optimisation: that
+   would conflate update with verify-and-repair, two different operations.
+   Callers who want verify-and-repair should pre-validate themselves and
+   only invoke `aupdate` when an update is actually requested.
+5. **No catastrophic-re-extract path** — there's no fresh-extract
+   fallback to revert to. Bounded by `max_attempts`; exhaustion raises.
+
 ## What stitchcall is **not**
 
-- **Not a replacement for trustcall.** Multi-schema, multi-call,
-  patch-existing-instances flows belong in trustcall.
+- **Not a replacement for trustcall.** Multi-schema, multi-call, and
+  *multi-instance* patch-existing flows belong in trustcall — those flows
+  need `tool_call_id` correlation, multi-schema routing, and
+  `ToolMessage`-based history that stitchcall's JSON-mode + HumanMessage
+  shape cannot express. **Single-instance** update is supported via
+  `aupdate` (see above) because the architectural objection to trustcall's
+  flow is specific to the multi-instance case.
+- **Not a multi-instance update primitive.** `aupdate` accepts exactly
+  one `existing` object. Multi-instance patching
+  (`existing={id1: ..., id2: ...}`) stays in trustcall by design — do not
+  add it here.
+- **Not a verify-and-repair primitive.** `aupdate` always runs at least
+  one LLM call. Callers who want "validate this; only call the model if
+  it's broken" should pre-validate with `schema.model_validate(...)` and
+  branch on `ValidationError` themselves — stitchcall does not conflate
+  the two operations.
 - **Not a tool-calling primitive.** No `bind_tools`, no `tool_choice`, no
   `tool_call_id` correlation, no `ToolMessage`. Single response, repair via
   JSON Patch over a HumanMessage chain.
@@ -233,8 +285,9 @@ mechanics carry across cleanly.
   not obviously friendly to streaming (you have to wait for the full
   initial JSON to validate before deciding whether to repair); deferred
   unless evidence suggests demand.
-- **Async vs sync.** Only `ainvoke` is exposed. A sync `invoke` is trivial
-  to add if anyone wants it; not in v0.0.1 to keep the surface minimal.
+- **Async vs sync.** Only async (`ainvoke`, `aupdate`) is exposed. Sync
+  variants are trivial to add if anyone wants them; not exposed yet to
+  keep the surface minimal.
 
 ## Rejected alternatives
 
@@ -242,8 +295,10 @@ mechanics carry across cleanly.
   incompatible with trustcall's `tool_call_id`-correlated patch repair,
   multi-schema routing, and `ToolMessage`-based history replay. Building
   a small sibling tool preserves trustcall's value where it is uniquely
-  useful (multi-schema, patch-existing-instances) and removes its
-  overhead where it is not.
+  useful (multi-schema, multi-instance patch-existing) and removes its
+  overhead where it is not. (Single-instance patch-existing is in scope
+  for stitchcall — see `aupdate` — because the architectural objection
+  above is multi-instance-specific.)
 - **Flat multi-call extraction** (`tools=[A, B], tool_choice="any"`).
   Empirically falsified above: 3 % vs 80 % success at fixed schema and
   workload. The model cannot maintain cross-call consistency without a
