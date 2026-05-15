@@ -203,11 +203,13 @@ async def test_aupdate_seeded_with_stringified_objects_normalises(fake_llm):
         messages=[],
     )
 
-    # Verify the patch prompt carried the normalised <previous>, not the
-    # stringified form (otherwise the model's JSON Pointer paths would
-    # have been computed against the wrong shape).
-    patch_prompt = fake_llm.patch_runnable.calls[0]["input"][-1].content
-    assert '"name": "carol"' in patch_prompt
-    assert '"value": 30' in patch_prompt
-    # The stringified form should NOT appear in the patch prompt:
-    assert '"{\\"name\\"' not in patch_prompt
+    # Verify the patch turn's AIMessage carried the NORMALISED prev_dict,
+    # not the stringified form (the model's JSON Pointer paths target the
+    # AIMessage's structure; if it were stringified the patch would fail).
+    sent_input = fake_llm.patch_runnable.calls[0]["input"]
+    prev_msg = sent_input[-2]
+    assert prev_msg.__class__.__name__ == "AIMessage"
+    assert '"name": "carol"' in prev_msg.content
+    assert '"value": 30' in prev_msg.content
+    # The stringified form should NOT appear in the AIMessage:
+    assert '"{\\"name\\"' not in prev_msg.content

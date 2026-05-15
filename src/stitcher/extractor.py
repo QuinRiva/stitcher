@@ -174,19 +174,22 @@ class Result(NamedTuple):
     raw_messages: list[BaseMessage]
 
 
-# Body of every patch-turn prompt: target schema + current state + pointer to
-# the structured-output schema for the response format and rules. The caller's
-# messages own the *what* (extraction prompt for ainvoke, update intent for
-# aupdate); this template owns the *how*. The detailed format and ops rules
-# live on JsonPatchResponse's field descriptions, where the model sees them
-# as part of the structured-output binding.
+# Body of every patch-turn prompt: target schema + how-to-patch instruction.
+# The caller's messages own the *what* (extraction prompt for ainvoke,
+# update intent for aupdate); this template owns the *how*. The detailed
+# format and ops rules live on JsonPatchResponse's field descriptions,
+# which the model sees as part of the structured-output binding.
+#
+# prev_dict is NOT embedded here — it lives in the AIMessage immediately
+# above this HumanMessage in patch_history. The two are contiguous so the
+# model has full attention on it; embedding it again as a `<previous>`
+# block was pure duplication and burned tokens for no benefit.
 _PATCH_PROMPT_TEMPLATE = (
     "The patched output must conform to this target schema:\n\n"
     "<schema>\n{schema}\n</schema>\n\n"
-    "<previous>\n{previous}\n</previous>\n\n"
-    "Produce a JSON Patch against the previous output that satisfies the "
-    "target schema. Return reasoning then operations — their format and ops "
-    "rules are in the structured-output schema."
+    "Produce a JSON Patch against your previous output (the assistant "
+    "message above). Return reasoning then operations — their format "
+    "and ops rules are in the structured-output schema."
 )
 
 # Prepended to the body when stitcher owns the *what* — i.e. when the
@@ -194,7 +197,6 @@ _PATCH_PROMPT_TEMPLATE = (
 _PATCH_REPAIR_PREFIX = (
     "Your previous JSON output failed validation.\n\n"
     "<errors>\n{errors}\n</errors>\n\n"
-    "The previous JSON output was:\n\n"
 )
 
 
@@ -451,7 +453,7 @@ class Extractor:
                 prev_dict, patch_error = await self._run_patch_turn(
                     prev_dict=prev_dict,
                     patch_prompt=_build_patch_prompt(
-                        prev_dict, last_validation_error, self._schema_json
+                        last_validation_error, self._schema_json
                     ),
                     original_messages=original_messages,
                     patch_config=patch_config,
@@ -705,7 +707,6 @@ def _error_weight(e: ValidationError) -> int:
 
 
 def _build_patch_prompt(
-    prev_dict: dict[str, Any],
     error: BaseException | None,
     schema_json: dict[str, Any],
 ) -> str:
@@ -718,25 +719,55 @@ def _build_patch_prompt(
     The body always embeds ``schema_json`` so the model has the target
     schema available on the patch turn (where the structured-output
     binding is on JsonPatchResponse, not the user's schema).
+
+    The model's previous output is NOT embedded here. It sits in the
+    AIMessage immediately preceding this HumanMessage in patch_history;
+    embedding it again would just burn tokens for no attention benefit.
     """
     body = _PATCH_PROMPT_TEMPLATE.format(
         schema=json.dumps(schema_json, indent=2),
-        previous=json.dumps(prev_dict, indent=2),
     )
     if error is None:
         return body
     if isinstance(error, ValidationError):
-        errors_text = json.dumps(
-            [
-                {
-                    "loc": list(err.get("loc", [])),
-                    "msg": err.get("msg", ""),
-                    "type": err.get("type", ""),
-                }
-                for err in error.errors()
-            ],
-            indent=2,
-        )
+        errors_text = _format_validation_errors(error.errors())
     else:
         errors_text = str(error)
     return _PATCH_REPAIR_PREFIX.format(errors=errors_text) + body
+
+
+def _loc_to_json_pointer(loc: tuple[str | int, ...]) -> str:
+    """Convert a Pydantic ``loc`` tuple to an RFC 6901 JSON Pointer.
+
+    Empty loc → ``""`` (root). Each segment is escaped per RFC 6901:
+    ``~`` → ``~0``, ``/`` → ``~1``. The model can paste the result
+    verbatim into a patch op's ``path`` field.
+    """
+    if not loc:
+        return ""
+    parts = [str(p).replace("~", "~0").replace("/", "~1") for p in loc]
+    return "/" + "/".join(parts)
+
+
+def _format_validation_errors(errs: list[dict[str, Any]]) -> str:
+    """Render Pydantic ``ValidationError.errors()`` as a readable text block.
+
+    Replaces the previous ``json.dumps(errors)`` rendering, which escaped
+    every ``\\n`` in user-supplied validator messages into literal ``\\n``
+    text — turning multi-line messages (markdown, examples, hints) into
+    unreadable single-line walls. Real newlines are preserved here.
+
+    Each error gets a one-line header (index, JSON Pointer path, Pydantic
+    error type) followed by the message verbatim. Errors are separated by
+    a blank line.
+    """
+    if not errs:
+        return "(no specific errors reported)"
+    blocks = []
+    for i, err in enumerate(errs, 1):
+        path = _loc_to_json_pointer(tuple(err.get("loc", ())))
+        err_type = err.get("type", "")
+        msg = err.get("msg", "")
+        header = f"[{i}] path {path or '(root)'} \u2014 {err_type}:"
+        blocks.append(f"{header}\n{msg}")
+    return "\n\n".join(blocks)

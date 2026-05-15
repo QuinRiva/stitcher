@@ -77,14 +77,20 @@ async def test_aupdate_first_turn_prompt_has_no_repair_prefix(fake_llm):
     )
 
     # The HumanMessage carrying the patch prompt is the last message in the
-    # sent input — assert it carries the target schema and the prior, but
-    # NOT the repair prefix (no validation failure on aupdate's first turn).
+    # sent input. The prev_dict is in the AIMessage immediately before it,
+    # NOT inside a `<previous>` block in the prompt itself (de-duplicated
+    # in 0.0.11).
     sent_input = fake_llm.patch_runnable.calls[0]["input"]
     patch_prompt = sent_input[-1].content
     assert "<schema>" in patch_prompt
-    assert "<previous>" in patch_prompt
+    assert "<previous>" not in patch_prompt
     assert "failed validation" not in patch_prompt
     assert "<errors>" not in patch_prompt
+    # And the prev_dict really is in the AIMessage above (so the model has
+    # something to patch against).
+    prev_msg = sent_input[-2]
+    assert prev_msg.__class__.__name__ == "AIMessage"
+    assert '"name": "Bob"' in prev_msg.content
 
 
 async def test_aupdate_retry_uses_repair_prefix(fake_llm):
