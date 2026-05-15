@@ -124,6 +124,38 @@ User-supplied keys win on collision — callers can pass
 `validation_context={"attempt_count": 5}` to simulate a later attempt in
 tests, also matching trustcall.
 
+### Per-attempt observability hook
+
+`Extractor(llm, schema, ..., on_attempt=callable)` registers an
+observability hook fired once per validation attempt with an
+`AttemptInfo(attempt_number, parsed, validation_errors, is_success)`.
+Mirrors trustcall's `on_attempt` for migration; the canonical use case
+is wide-logging per-attempt failure classifications (validation_failure
+vs patch_apply_failure vs success) for observability tools.
+
+Fires at three points inside the patch loop:
+
+- After successful `model_validate` — `is_success=True`,
+  `validation_errors=[]`, `parsed=<the validated dict>`.
+- After failed `model_validate` — `is_success=False`,
+  `validation_errors=<list of formatted 'loc: msg' strings>`, `parsed=<the
+  dict that failed>`.
+- After a patch the model returned could not be applied (bad pointer,
+  malformed op) — `is_success=False`, `parsed=None`,
+  `validation_errors=[<the patch-failure message>]`.
+
+Sync (`def`) and async (`async def`) callables both work; stitcher
+awaits if the return is a coroutine.
+
+Deliberate divergence from trustcall: `AttemptInfo` does **not** carry
+an `ai_message` field. Stitcher uses `with_structured_output()`, which
+returns a parsed dict and hides the underlying `AIMessage` — synthesizing
+a fake one would lose `response_metadata` / `usage_metadata` and silently
+break callers who depend on them. If you need raw response metadata
+(token counts, finish_reason, etc.), pass a `BaseCallbackHandler` via
+`callbacks=` instead — it fires on the underlying LLM call where the
+real metadata lives.
+
 ## What stitcher is **not**
 
 - **Not a replacement for trustcall.** Multi-schema, multi-call, and

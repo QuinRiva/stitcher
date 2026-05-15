@@ -31,8 +31,10 @@ Design rationale: see ``docs/intent.md``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, NamedTuple, TypeAlias
+from collections.abc import Awaitable
+from typing import Any, Callable, NamedTuple, TypeAlias
 
 import jsonpatch
 from langchain_core.callbacks import BaseCallbackHandler
@@ -45,6 +47,38 @@ from stitcher.exceptions import AggregatedValidationError
 
 ValidationContext: TypeAlias = dict[str, Any]
 Callbacks: TypeAlias = list[BaseCallbackHandler]
+
+
+class AttemptInfo(NamedTuple):
+    """Per-attempt observability payload, fired by ``Extractor.on_attempt``.
+
+    Differs from trustcall's ``AttemptInfo`` by omitting ``ai_message``:
+    stitcher uses LangChain's ``with_structured_output``, which returns a
+    parsed dict rather than a raw ``AIMessage`` — synthesizing a fake one
+    here would lose ``response_metadata`` / ``usage_metadata`` and silently
+    break callers who need that data. If you need raw response metadata
+    (token counts, finish_reason, etc.), pass a ``BaseCallbackHandler`` via
+    ``callbacks=`` — it fires on the underlying LLM call.
+
+    Fields:
+        attempt_number: 1 on the first validation, incrementing per attempt
+            (matches the ``attempt_count`` injected into validation_context).
+        parsed: the parsed dict that was validated, or ``None`` if the
+            model's JSON Patch could not be applied (no validate happened).
+        validation_errors: list of formatted ``loc: msg`` strings, one per
+            entry in ``ValidationError.errors()``. Empty list on success.
+        is_success: convenience boolean (``not validation_errors`` is
+            equivalent).
+    """
+    attempt_number: int
+    parsed: dict[str, Any] | None
+    validation_errors: list[str]
+    is_success: bool
+
+
+# Both sync (returns None) and async (returns Awaitable[None]) callables
+# are accepted; stitcher awaits if the return is a coroutine.
+OnAttempt: TypeAlias = Callable[["AttemptInfo"], None | Awaitable[None]]
 
 
 class JsonPatchResponse(BaseModel):
@@ -103,6 +137,12 @@ class Extractor:
             a single pass exceeds this, the patch loop is abandoned and a
             fresh extract is performed instead. ``None`` disables the
             catastrophic-re-extract path entirely.
+        on_attempt: optional observability hook fired once per validation
+            attempt with an ``AttemptInfo``. Sync or async callables both
+            work (async ones are awaited). Fired on validation success,
+            validation failure, and patch-application failure (the third
+            with ``parsed=None``). Mirrors trustcall's ``on_attempt`` for
+            migration; see ``AttemptInfo`` for shape differences.
 
     Example:
         >>> from pydantic import BaseModel
@@ -129,11 +169,13 @@ class Extractor:
         *,
         max_attempts: int = 5,
         max_validation_error_weight: int | None = 40,
+        on_attempt: OnAttempt | None = None,
     ) -> None:
         self.llm = llm
         self.schema = schema
         self.max_attempts = max_attempts
         self.max_validation_error_weight = max_validation_error_weight
+        self._on_attempt = on_attempt
         # Bind the user's schema as a JSON-schema dict so the structured-output
         # endpoint returns a parsed dict (which we re-validate ourselves with
         # the user-supplied validation context — model_validate via langchain's
@@ -298,6 +340,7 @@ class Extractor:
                 )
                 if patch_error is not None:
                     last_validation_error = patch_error
+                    await self._fire_attempt(attempts, None, [str(patch_error)], False)
                     continue
 
             # Inject attempt_count so validators can implement
@@ -307,6 +350,7 @@ class Extractor:
             ctx = {"attempt_count": attempts, **(validation_context or {})}
             try:
                 value = self.schema.model_validate(prev_dict, context=ctx)
+                await self._fire_attempt(attempts, prev_dict, [], True)
                 return Result(
                     value=value,
                     attempts=attempts,
@@ -315,6 +359,7 @@ class Extractor:
                 )
             except ValidationError as e:
                 last_validation_error = e
+                await self._fire_attempt(attempts, prev_dict, _format_validation_errors(e), False)
                 if (
                     allow_re_extract
                     and self.max_validation_error_weight is not None
@@ -325,6 +370,7 @@ class Extractor:
                 continue
             except AggregatedValidationError as e:
                 last_validation_error = e
+                await self._fire_attempt(attempts, prev_dict, [str(e)], False)
                 if (
                     allow_re_extract
                     and self.max_validation_error_weight is not None
@@ -338,6 +384,27 @@ class Extractor:
             f"Extractor exhausted {self.max_attempts} attempts. "
             f"Last validation error: {last_validation_error!r}"
         )
+
+    async def _fire_attempt(
+        self,
+        attempt_number: int,
+        parsed: dict[str, Any] | None,
+        validation_errors: list[str],
+        is_success: bool,
+    ) -> None:
+        """Fire the on_attempt hook if set; await if it returns a coroutine."""
+        if self._on_attempt is None:
+            return
+        result = self._on_attempt(
+            AttemptInfo(
+                attempt_number=attempt_number,
+                parsed=parsed,
+                validation_errors=validation_errors,
+                is_success=is_success,
+            )
+        )
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _run_patch_turn(
         self,
@@ -383,6 +450,21 @@ class Extractor:
                 f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
                 "Re-issue a corrected patch against the previous JSON output."
             )
+
+def _format_validation_errors(e: ValidationError) -> list[str]:
+    """Format a Pydantic ValidationError as a list of ``loc: msg`` strings.
+
+    Used as the ``validation_errors`` field on AttemptInfo so callers don't
+    have to re-parse Pydantic's nested error dicts to log per-attempt
+    failures.
+    """
+    formatted: list[str] = []
+    for err in e.errors():
+        loc = ".".join(str(p) for p in err.get("loc", []))
+        msg = err.get("msg", "")
+        formatted.append(f"{loc}: {msg}" if loc else msg)
+    return formatted
+
 
 def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""
