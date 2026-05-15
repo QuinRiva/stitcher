@@ -128,33 +128,44 @@ tests, also matching trustcall.
 
 `Extractor(llm, schema, ..., on_attempt=callable)` registers an
 observability hook fired once per validation attempt with an
-`AttemptInfo(attempt_number, parsed, validation_errors, is_success)`.
-Mirrors trustcall's `on_attempt` for migration; the canonical use case
-is wide-logging per-attempt failure classifications (validation_failure
+`AttemptInfo(attempt_number, parsed, error, is_success)`. Mirrors
+trustcall's `on_attempt` for migration; the canonical use case is
+wide-logging per-attempt failure classifications (validation_failure
 vs patch_apply_failure vs success) for observability tools.
 
 Fires at three points inside the patch loop:
 
-- After successful `model_validate` — `is_success=True`,
-  `validation_errors=[]`, `parsed=<the validated dict>`.
+- After successful `model_validate` — `is_success=True`, `error=None`,
+  `parsed=<the validated dict>`.
 - After failed `model_validate` — `is_success=False`,
-  `validation_errors=<list of formatted 'loc: msg' strings>`, `parsed=<the
-  dict that failed>`.
+  `error=<the ValidationError>`, `parsed=<the dict that failed>`. Callers
+  classify by inspecting `error.errors()` for `type`, `loc`,
+  `ctx["error"]` (the latter carries any nested
+  `AggregatedValidationError`).
 - After a patch the model returned could not be applied (bad pointer,
-  malformed op) — `is_success=False`, `parsed=None`,
-  `validation_errors=[<the patch-failure message>]`.
+  malformed op) — `is_success=False`, `parsed=None`, `error=<a synthetic
+  ValueError>`. `isinstance(error, ValidationError)` discriminates
+  validation-failures from patch-apply-failures.
 
 Sync (`def`) and async (`async def`) callables both work; stitcher
 awaits if the return is a coroutine.
 
-Deliberate divergence from trustcall: `AttemptInfo` does **not** carry
-an `ai_message` field. Stitcher uses `with_structured_output()`, which
-returns a parsed dict and hides the underlying `AIMessage` — synthesizing
-a fake one would lose `response_metadata` / `usage_metadata` and silently
-break callers who depend on them. If you need raw response metadata
-(token counts, finish_reason, etc.), pass a `BaseCallbackHandler` via
-`callbacks=` instead — it fires on the underlying LLM call where the
-real metadata lives.
+Two deliberate divergences from trustcall, both for the same reason —
+stitcher passes the consumer the real underlying object rather than a
+flattened/synthesized stand-in:
+
+- `AttemptInfo` does **not** carry an `ai_message` field. Stitcher uses
+  `with_structured_output()`, which returns a parsed dict and hides the
+  underlying `AIMessage` — synthesizing a fake one would lose
+  `response_metadata` / `usage_metadata` and silently break callers who
+  depend on them. If you need raw response metadata (token counts,
+  finish_reason, etc.), pass a `BaseCallbackHandler` via `callbacks=`
+  instead.
+- `AttemptInfo.error` is a raw `BaseException`, not a `list[str]` of
+  pre-formatted messages. Adjudicators classify failures by structured
+  fields (`type`, `loc`, `ctx["error"]`) — stitcher pre-formatting to
+  strings would throw away the structure right where the consumer needs
+  it. Format however your wide-log expects.
 
 ## What stitcher is **not**
 

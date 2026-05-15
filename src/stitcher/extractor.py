@@ -52,27 +52,37 @@ Callbacks: TypeAlias = list[BaseCallbackHandler]
 class AttemptInfo(NamedTuple):
     """Per-attempt observability payload, fired by ``Extractor.on_attempt``.
 
-    Differs from trustcall's ``AttemptInfo`` by omitting ``ai_message``:
-    stitcher uses LangChain's ``with_structured_output``, which returns a
-    parsed dict rather than a raw ``AIMessage`` — synthesizing a fake one
-    here would lose ``response_metadata`` / ``usage_metadata`` and silently
-    break callers who need that data. If you need raw response metadata
-    (token counts, finish_reason, etc.), pass a ``BaseCallbackHandler`` via
-    ``callbacks=`` — it fires on the underlying LLM call.
+    Diverges from trustcall's ``AttemptInfo`` in two places, both for the
+    same reason — stitcher hands the consumer the real underlying object
+    rather than a flattened/synthesized stand-in:
+
+    - **No ``ai_message``.** Stitcher uses LangChain's
+      ``with_structured_output``, which returns a parsed dict rather than a
+      raw ``AIMessage``. Synthesizing one would lose ``response_metadata``
+      / ``usage_metadata`` and silently break callers who depend on them.
+      If you need raw response metadata (token counts, finish_reason,
+      etc.), pass a ``BaseCallbackHandler`` via ``callbacks=`` — it fires
+      on the underlying LLM call.
+    - **``error: BaseException | None`` instead of ``validation_errors:
+      list[str]``.** Adjudicators classify failures by ``error.errors()``
+      structure (``type``, ``loc``, ``ctx["error"]`` for nested
+      ``AggregatedValidationError``) — stitcher pre-formatting to strings
+      would throw away the structure right where the consumer needs it.
+      Format the exception however your wide-log expects.
 
     Fields:
         attempt_number: 1 on the first validation, incrementing per attempt
             (matches the ``attempt_count`` injected into validation_context).
         parsed: the parsed dict that was validated, or ``None`` if the
             model's JSON Patch could not be applied (no validate happened).
-        validation_errors: list of formatted ``loc: msg`` strings, one per
-            entry in ``ValidationError.errors()``. Empty list on success.
-        is_success: convenience boolean (``not validation_errors`` is
-            equivalent).
+        error: the failure that drove this attempt's classification —
+            ``ValidationError`` for a Pydantic failure, ``ValueError`` for a
+            patch-apply failure, ``None`` on success.
+        is_success: convenience boolean (equivalent to ``error is None``).
     """
     attempt_number: int
     parsed: dict[str, Any] | None
-    validation_errors: list[str]
+    error: BaseException | None
     is_success: bool
 
 
@@ -340,7 +350,7 @@ class Extractor:
                 )
                 if patch_error is not None:
                     last_validation_error = patch_error
-                    await self._fire_attempt(attempts, None, [str(patch_error)], False)
+                    await self._fire_attempt(attempts, None, patch_error)
                     continue
 
             # Inject attempt_count so validators can implement
@@ -350,7 +360,7 @@ class Extractor:
             ctx = {"attempt_count": attempts, **(validation_context or {})}
             try:
                 value = self.schema.model_validate(prev_dict, context=ctx)
-                await self._fire_attempt(attempts, prev_dict, [], True)
+                await self._fire_attempt(attempts, prev_dict, None)
                 return Result(
                     value=value,
                     attempts=attempts,
@@ -359,7 +369,7 @@ class Extractor:
                 )
             except ValidationError as e:
                 last_validation_error = e
-                await self._fire_attempt(attempts, prev_dict, _format_validation_errors(e), False)
+                await self._fire_attempt(attempts, prev_dict, e)
                 if (
                     allow_re_extract
                     and self.max_validation_error_weight is not None
@@ -370,7 +380,7 @@ class Extractor:
                 continue
             except AggregatedValidationError as e:
                 last_validation_error = e
-                await self._fire_attempt(attempts, prev_dict, [str(e)], False)
+                await self._fire_attempt(attempts, prev_dict, e)
                 if (
                     allow_re_extract
                     and self.max_validation_error_weight is not None
@@ -389,8 +399,7 @@ class Extractor:
         self,
         attempt_number: int,
         parsed: dict[str, Any] | None,
-        validation_errors: list[str],
-        is_success: bool,
+        error: BaseException | None,
     ) -> None:
         """Fire the on_attempt hook if set; await if it returns a coroutine."""
         if self._on_attempt is None:
@@ -399,8 +408,8 @@ class Extractor:
             AttemptInfo(
                 attempt_number=attempt_number,
                 parsed=parsed,
-                validation_errors=validation_errors,
-                is_success=is_success,
+                error=error,
+                is_success=error is None,
             )
         )
         if asyncio.iscoroutine(result):
@@ -450,21 +459,6 @@ class Extractor:
                 f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
                 "Re-issue a corrected patch against the previous JSON output."
             )
-
-def _format_validation_errors(e: ValidationError) -> list[str]:
-    """Format a Pydantic ValidationError as a list of ``loc: msg`` strings.
-
-    Used as the ``validation_errors`` field on AttemptInfo so callers don't
-    have to re-parse Pydantic's nested error dicts to log per-attempt
-    failures.
-    """
-    formatted: list[str] = []
-    for err in e.errors():
-        loc = ".".join(str(p) for p in err.get("loc", []))
-        msg = err.get("msg", "")
-        formatted.append(f"{loc}: {msg}" if loc else msg)
-    return formatted
-
 
 def _error_weight(e: ValidationError) -> int:
     """Sum per-entry weights. AggregatedValidationError(count=N) -> N, else 1."""

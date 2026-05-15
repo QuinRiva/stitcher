@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, model_validator
 
+from pydantic import ValidationError
+
 from stitcher import AttemptInfo, Extractor
 from stitcher.extractor import JsonPatchResponse
 
@@ -42,7 +44,7 @@ async def test_on_attempt_fires_once_on_success(fake_llm):
     info = seen[0]
     assert info.attempt_number == 1
     assert info.parsed == {"name": "Alice", "age": 30}
-    assert info.validation_errors == []
+    assert info.error is None
     assert info.is_success is True
 
 
@@ -69,8 +71,9 @@ async def test_on_attempt_fires_per_validation_attempt(fake_llm):
     assert seen[2].parsed == {"name": "Bob", "age": 7}
 
 
-async def test_on_attempt_validation_errors_formatted_loc_msg(fake_llm):
-    """validation_errors is a list of 'loc: msg' strings, ready to log."""
+async def test_on_attempt_validation_failure_passes_raw_exception(fake_llm):
+    """On validation failure, error is the raw ValidationError — callers can
+    introspect via .errors() to classify (type, loc, ctx['error'])."""
     seen: list[AttemptInfo] = []
     fake_llm.set_scripts(
         initial=[{"name": "Carol", "age": -5}],
@@ -81,11 +84,12 @@ async def test_on_attempt_validation_errors_formatted_loc_msg(fake_llm):
     await extractor.ainvoke([])
 
     assert seen[0].is_success is False
-    assert len(seen[0].validation_errors) == 1
-    err = seen[0].validation_errors[0]
-    assert err.startswith("Value error,") or "non-negative" in err
-    # The Pydantic error has loc=() for model_validator(mode="after"), so the
-    # formatted string is just the message (no leading 'loc: ').
+    assert isinstance(seen[0].error, ValidationError)
+    # Caller can introspect the structure they need:
+    errs = seen[0].error.errors()
+    assert len(errs) == 1
+    assert errs[0]["type"] == "value_error"
+    assert "non-negative" in errs[0]["msg"]
 
 
 async def test_on_attempt_fires_for_patch_apply_failure(fake_llm):
@@ -108,9 +112,14 @@ async def test_on_attempt_fires_for_patch_apply_failure(fake_llm):
     # 3 attempts: initial validate-fail, patch-apply-fail, patch-success
     assert [info.attempt_number for info in seen] == [1, 2, 3]
     assert [info.is_success for info in seen] == [False, False, True]
-    # Attempt 2 is the patch-apply failure: parsed is None, error is the patch failure msg
+    # Attempt 2 is the patch-apply failure: parsed is None, error is a ValueError
+    # (synthesized from the jsonpatch exception) — NOT a ValidationError. Callers
+    # classifying failures should isinstance-discriminate to distinguish patch-apply
+    # failures from Pydantic validation failures.
     assert seen[1].parsed is None
-    assert "could not be applied" in seen[1].validation_errors[0].lower()
+    assert isinstance(seen[1].error, ValueError)
+    assert not isinstance(seen[1].error, ValidationError)
+    assert "could not be applied" in str(seen[1].error).lower()
 
 
 async def test_on_attempt_supports_async_callback(fake_llm):
