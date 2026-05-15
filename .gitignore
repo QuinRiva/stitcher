@@ -64,10 +64,7 @@ results/
 *_trace_*.json
 trace_*.json
 
-# Project-specific words that should never appear in this OSS repo —
-# tracked here so anyone editing knows the boundary. Files matching
-# these are ignored as a tripwire.
-
-
-
-
+# (anti-leak tripwires intentionally not enumerated here — they were
+# more harm than help: broad globs caught legitimate filenames like
+# 'release_notes.md', and the tripwire file itself ended up tracked,
+# leaking the very words it was trying to ban. Rely on review instead.)

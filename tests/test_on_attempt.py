@@ -3,8 +3,8 @@
 Mirrors trustcall's ``on_attempt`` hook (with ``ai_message`` deliberately
 omitted — see ``AttemptInfo`` docstring). Lets callers wide-log
 per-attempt classifications (validation_failure vs patch_apply_failure vs
-success) for observability \u2014 the use case the downstream
-adjudicator originally relied on.
+success) for observability — the canonical use case is a downstream
+adjudicator that classifies failures across many attempts.
 """
 from __future__ import annotations
 

@@ -34,12 +34,11 @@ don't use. It also opens specific failure modes — the model emitting the
 same tool call twice in one turn, or emitting one valid + one empty
 duplicate — that don't exist in JSON mode at all.
 
-The trade gets worse on weaker models. In our benchmarks, on a
-large extraction prompt with a wrapping schema that requires
-N-element list invariants, current trustcall + tools achieves ~80 % success
-per trial on Gemini 3 Flash; switching the *same schema* to native JSON
-mode + JSON-Patch repair achieves 100 % success in roughly half the
-wall-time (see "Empirical evidence" below).
+The trade gets worse on weaker models. On a large extraction prompt with
+a wrapping schema that requires N-element list invariants, trustcall +
+tools at ~80 % per-trial success on Gemini 3 Flash improved to 100 % at
+roughly half the wall-time when the *same schema* was switched to native
+JSON mode + JSON-Patch repair (see "Empirical evidence" below).
 
 ## What stitcher is
 
@@ -261,10 +260,10 @@ contract is the user's.
 
 ## Empirical evidence
 
-The design was validated against a non-trivial workload:
-a single Pydantic schema with cross-field invariants over a list of N
-items, prompted with a ~500k-token user message, run on
-`gemini-3-flash-preview` at temperature 1.
+The design was validated against a single non-trivial workload: one
+Pydantic schema with cross-field invariants over a list of N items, a
+long user message, run on `gemini-3-flash-preview` at temperature 1, 30
+trials per shape.
 
 | Shape | n | success | mean wall (s) | mean attempts |
 |---|---|---|---|---|
@@ -279,10 +278,10 @@ primitive) change.
 Notable findings:
 
 - **JSON-mode binding works on a non-trivial schema as-is.** The schema
-  used here had recursive `$defs`, `anyOf` unions, and a
-  sentinel-forced field (`(field redacted)` accepting either `str` or
-  `list[str]`). LangChain's `with_structured_output(method="json_schema")`
-  accepted it without modification.
+  used had recursive `$defs`, `anyOf` unions, and a sentinel-forced field
+  accepting either `str` or `list[str]`. LangChain's
+  `with_structured_output(method="json_schema")` accepted it without
+  modification.
 - **The validator's JSON-Pointer paths drive the patch loop.** Trials that
   succeeded on a patch turn used patches whose `path` values came directly
   from the validator's error text. Single-op patches (one `remove` to fix
