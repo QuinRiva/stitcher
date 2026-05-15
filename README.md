@@ -18,9 +18,13 @@ update to one existing instance" (`aupdate`) — with a smaller surface and
 
 ## Install
 
+Not on PyPI — install from the GitHub repo:
+
 ```bash
-pip install stitcher
+pip install "git+ssh://git@github.com/QuinRiva/stitcher.git"
 ```
+
+Or pin to a specific commit (see [Status](#status) below).
 
 Requires Python ≥ 3.11.
 
