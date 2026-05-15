@@ -177,72 +177,13 @@ class Extractor:
             RuntimeError: if ``max_attempts`` is exhausted without a valid
                 extraction.
         """
-        initial_run_name = f"{run_name}.initial" if run_name else "stitchcall_initial"
-        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
-
-        original_messages = list(messages)
-        attempts = 0
-        was_re_extracted = False
-        raw_messages: list[BaseMessage] = list(original_messages)
-
-        prev_dict: dict[str, Any] | None = None
-        last_validation_error: BaseException | None = None
-
-        while attempts < self.max_attempts:
-            attempts += 1
-
-            if prev_dict is None:
-                prev_dict = await self._initial_llm.ainvoke(
-                    original_messages,
-                    config={"callbacks": callbacks or [], "run_name": initial_run_name},
-                )
-                raw_messages.append(AIMessage(content=json.dumps(prev_dict, default=str)))
-            else:
-                prev_dict, patch_error = await self._run_patch_turn(
-                    prev_dict=prev_dict,
-                    patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
-                    original_messages=original_messages,
-                    patch_run_name=patch_run_name,
-                    callbacks=callbacks,
-                    raw_messages=raw_messages,
-                )
-                if patch_error is not None:
-                    # Patch couldn't be applied — feed the error back to the
-                    # model on the next turn.
-                    last_validation_error = patch_error
-                    continue
-
-            try:
-                value = self.schema.model_validate(prev_dict, context=validation_context)
-                return Result(
-                    value=value,
-                    attempts=attempts,
-                    was_re_extracted=was_re_extracted,
-                    raw_messages=raw_messages,
-                )
-            except ValidationError as e:
-                last_validation_error = e
-                weight = _error_weight(e)
-                if (
-                    self.max_validation_error_weight is not None
-                    and weight > self.max_validation_error_weight
-                ):
-                    was_re_extracted = True
-                    prev_dict = None
-                continue
-            except AggregatedValidationError as e:
-                last_validation_error = e
-                if (
-                    self.max_validation_error_weight is not None
-                    and e.count > self.max_validation_error_weight
-                ):
-                    was_re_extracted = True
-                    prev_dict = None
-                continue
-
-        raise RuntimeError(
-            f"Extractor exhausted {self.max_attempts} attempts. "
-            f"Last validation error: {last_validation_error!r}"
+        return await self._patch_loop(
+            original_messages=list(messages),
+            prev_dict=None,
+            run_name=run_name,
+            callbacks=callbacks,
+            validation_context=validation_context,
+            allow_re_extract=True,
         )
 
     async def aupdate(
@@ -285,52 +226,107 @@ class Extractor:
         Raises:
             RuntimeError: if ``max_attempts`` is exhausted.
         """
-        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
-
-        original_messages = list(messages)
-        raw_messages: list[BaseMessage] = list(original_messages)
-
         prev_dict: dict[str, Any] = (
             existing.model_dump(mode="json")
             if isinstance(existing, BaseModel)
             else existing
         )
+        return await self._patch_loop(
+            original_messages=list(messages),
+            prev_dict=prev_dict,
+            run_name=run_name,
+            callbacks=callbacks,
+            validation_context=validation_context,
+            allow_re_extract=False,
+        )
 
+    async def _patch_loop(
+        self,
+        *,
+        original_messages: list[BaseMessage],
+        prev_dict: dict[str, Any] | None,
+        run_name: str | None,
+        callbacks: Callbacks | None,
+        validation_context: ValidationContext | None,
+        allow_re_extract: bool,
+    ) -> Result:
+        """Shared validate-and-patch loop for ``ainvoke`` and ``aupdate``.
+
+        State machine on each iteration, driven by ``(prev_dict, last_error)``:
+
+        - ``prev_dict is None`` → initial extract via JSON mode (only ever
+          reached from ``ainvoke``: either the first iteration or after the
+          catastrophic-re-extract path resets ``prev_dict`` to ``None``).
+        - ``prev_dict`` set, ``last_error is None`` → headerless patch turn;
+          the user's messages own the *what* (``aupdate``'s first turn).
+        - ``prev_dict`` set, ``last_error`` set → repair patch turn; the
+          validator-failure prefix is prepended to the patch prompt.
+
+        ``allow_re_extract`` gates the catastrophic-re-extract path — only
+        ``ainvoke`` enables it because only ``ainvoke`` has a fresh-extract
+        path to fall back to.
+        """
+        initial_run_name = f"{run_name}.initial" if run_name else "stitchcall_initial"
+        patch_run_name = f"{run_name}.patch" if run_name else "stitchcall_patch"
+
+        raw_messages: list[BaseMessage] = list(original_messages)
         attempts = 0
+        was_re_extracted = False
         last_validation_error: BaseException | None = None
 
         while attempts < self.max_attempts:
             attempts += 1
 
-            # First turn: last_validation_error is None → no repair prefix
-            # → the user's messages own the *what*. Subsequent turns: error
-            # is set → prefix prepended → patch is validator-driven.
-            prev_dict, patch_error = await self._run_patch_turn(
-                prev_dict=prev_dict,
-                patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
-                original_messages=original_messages,
-                patch_run_name=patch_run_name,
-                callbacks=callbacks,
-                raw_messages=raw_messages,
-            )
-            if patch_error is not None:
-                last_validation_error = patch_error
-                continue
+            if prev_dict is None:
+                prev_dict = await self._initial_llm.ainvoke(
+                    original_messages,
+                    config={"callbacks": callbacks or [], "run_name": initial_run_name},
+                )
+                raw_messages.append(AIMessage(content=json.dumps(prev_dict, default=str)))
+            else:
+                prev_dict, patch_error = await self._run_patch_turn(
+                    prev_dict=prev_dict,
+                    patch_prompt=_build_patch_prompt(prev_dict, last_validation_error),
+                    original_messages=original_messages,
+                    patch_run_name=patch_run_name,
+                    callbacks=callbacks,
+                    raw_messages=raw_messages,
+                )
+                if patch_error is not None:
+                    last_validation_error = patch_error
+                    continue
 
             try:
                 value = self.schema.model_validate(prev_dict, context=validation_context)
                 return Result(
                     value=value,
                     attempts=attempts,
-                    was_re_extracted=False,
+                    was_re_extracted=was_re_extracted,
                     raw_messages=raw_messages,
                 )
-            except (ValidationError, AggregatedValidationError) as e:
+            except ValidationError as e:
                 last_validation_error = e
+                if (
+                    allow_re_extract
+                    and self.max_validation_error_weight is not None
+                    and _error_weight(e) > self.max_validation_error_weight
+                ):
+                    was_re_extracted = True
+                    prev_dict = None
+                continue
+            except AggregatedValidationError as e:
+                last_validation_error = e
+                if (
+                    allow_re_extract
+                    and self.max_validation_error_weight is not None
+                    and e.count > self.max_validation_error_weight
+                ):
+                    was_re_extracted = True
+                    prev_dict = None
                 continue
 
         raise RuntimeError(
-            f"Extractor exhausted {self.max_attempts} attempts in aupdate. "
+            f"Extractor exhausted {self.max_attempts} attempts. "
             f"Last validation error: {last_validation_error!r}"
         )
 
