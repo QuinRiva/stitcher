@@ -161,9 +161,13 @@ class Extractor:
             messages: conversation history to send to the model. Accepts either
                 LangChain ``BaseMessage`` instances or plain ``{role, content}``
                 dicts (with role in ``system | human | user | ai | assistant``).
-            validation_context: passed verbatim to ``schema.model_validate(...,
-                context=...)`` on every validation pass. Use this for any
-                cross-field invariants the schema's validators need.
+            validation_context: passed to ``schema.model_validate(...,
+                context=...)`` on every validation pass, with one
+                stitchcall-supplied key merged in: ``attempt_count`` (1 on
+                the first validation, 2 after the first patch, ...). User
+                keys override on collision (matches trustcall's contract).
+                Use this for any cross-field invariants the schema's
+                validators need.
             callbacks: LangChain callback handlers, threaded into every LLM call
                 (initial extract, every patch turn).
             run_name: optional prefix for internal LLM run names
@@ -296,8 +300,13 @@ class Extractor:
                     last_validation_error = patch_error
                     continue
 
+            # Inject attempt_count so validators can implement
+            # first-attempt-strict / later-lenient patterns. Matches trustcall's
+            # contract: user-supplied keys win, so callers can override
+            # (typically only useful for testing).
+            ctx = {"attempt_count": attempts, **(validation_context or {})}
             try:
-                value = self.schema.model_validate(prev_dict, context=validation_context)
+                value = self.schema.model_validate(prev_dict, context=ctx)
                 return Result(
                     value=value,
                     attempts=attempts,

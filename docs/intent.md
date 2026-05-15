@@ -109,6 +109,21 @@ result = await extractor.aupdate(existing=prior,
 5. **No catastrophic-re-extract path** — there's no fresh-extract
    fallback to revert to. Bounded by `max_attempts`; exhaustion raises.
 
+### Validation context contract
+
+On every `model_validate` call (in either `ainvoke` or `aupdate`), stitchcall
+merges one library-supplied key into the user's `validation_context`:
+
+- `attempt_count: int` — 1 on the first validation, incrementing by one
+  per validation attempt. Mirrors trustcall's contract so validators can
+  implement first-attempt-strict / later-lenient patterns (e.g. an
+  adjudicator that pushes back on the LLM once but accepts its judgment on
+  retry).
+
+User-supplied keys win on collision — callers can pass
+`validation_context={"attempt_count": 5}` to simulate a later attempt in
+tests, also matching trustcall.
+
 ## What stitchcall is **not**
 
 - **Not a replacement for trustcall.** Multi-schema, multi-call, and

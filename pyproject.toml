@@ -1,6 +1,6 @@
 [project]
 name = "stitchcall"
-version = "0.0.2"
+version = "0.0.3"
 description = "Single-schema LLM extraction with Pydantic validation and JSON-Patch repair. Trust the model to be mostly right; stitch the gaps."
 readme = "README.md"
 license = { text = "MIT" }
