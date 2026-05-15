@@ -154,11 +154,11 @@ async def test_aupdate_run_name_threads_to_every_patch_turn(fake_llm):
     assert fake_llm.initial_runnable.calls == []
     assert len(fake_llm.patch_runnable.calls) == 2
     for call in fake_llm.patch_runnable.calls:
-        assert call["config"]["run_name"] == "reconciliation_batch_3.patch"
+        assert call["config"]["run_name"] == "patch"
 
 
 async def test_aupdate_run_name_default_when_unset(fake_llm):
-    """Without ``run_name``, patch calls fall back to ``stitcher.patch``."""
+    """Without ``run_name``, patch calls fall back to the fixed child name ``patch``."""
     fake_llm.set_scripts(
         initial=[],
         patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 22}])],
@@ -167,7 +167,7 @@ async def test_aupdate_run_name_default_when_unset(fake_llm):
 
     await extractor.aupdate(existing={"name": "Frank", "age": 30}, messages=[])
 
-    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitcher.patch"
+    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "patch"
 
 
 async def test_aupdate_exhausts_attempts_and_raises(fake_llm):

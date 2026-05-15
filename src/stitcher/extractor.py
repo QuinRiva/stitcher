@@ -39,6 +39,7 @@ from typing import Any, Callable, NamedTuple, TypeAlias
 import jsonpatch
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from stitcher.exceptions import AggregatedValidationError
@@ -284,11 +285,13 @@ class Extractor:
                 keys override on collision (matches trustcall's contract).
                 Use this for any cross-field invariants the schema's
                 validators need.
-            run_name: optional run name. The initial extract uses this
-                value verbatim (or ``"stitcher"`` when unset); patch turns
-                append ``.patch`` so retries are distinguishable in traces.
-                Use this to differentiate per-call-site traces in tools
-                like Langfuse.
+            run_name: optional name for the parent extraction run. Stitcher
+                wraps each call in a ``RunnableLambda`` so the initial
+                extract and any patch turns appear as children of one
+                parent in the trace tree (one Langfuse trace per
+                ``ainvoke`` call). The user-supplied ``run_name`` becomes
+                the parent's name; children are always ``"initial"`` and
+                ``"patch"``. Defaults to ``"stitcher"`` when unset.
             **config: forwarded verbatim to LangChain's ``RunnableConfig``
                 on every LLM call (initial extract, every patch turn).
                 Common fields: ``callbacks=[handler, ...]`` for trace
@@ -305,14 +308,25 @@ class Extractor:
             RuntimeError: if ``max_attempts`` is exhausted without a valid
                 extraction.
         """
-        return await self._patch_loop(
-            original_messages=messages,
-            prev_dict=None,
-            run_name=run_name,
-            config=config,
-            validation_context=validation_context,
-            allow_re_extract=True,
-        )
+        # Wrap the patch loop in a RunnableLambda so LangChain's callback
+        # machinery establishes a parent run — the initial extract and any
+        # patch turns become children in the trace tree (one Langfuse trace
+        # per ainvoke call instead of N separate ones). User-supplied
+        # callbacks/tags/metadata are attached to the parent and inherited
+        # by children via LangChain's context-var propagation.
+        async def _execute(_input: Any) -> Result:
+            return await self._patch_loop(
+                original_messages=messages,
+                prev_dict=None,
+                validation_context=validation_context,
+                allow_re_extract=True,
+            )
+
+        parent_config: dict[str, Any] = {
+            **config,
+            "run_name": run_name or "stitcher",
+        }
+        return await RunnableLambda(_execute).ainvoke(None, config=parent_config)
 
     async def aupdate(
         self,
@@ -360,26 +374,37 @@ class Extractor:
             if isinstance(existing, BaseModel)
             else existing
         )
-        return await self._patch_loop(
-            original_messages=messages,
-            prev_dict=prev_dict,
-            run_name=run_name,
-            config=config,
-            validation_context=validation_context,
-            allow_re_extract=False,
-        )
+
+        # Same parent-runnable wrapping as ainvoke — see comment there.
+        async def _execute(_input: Any) -> Result:
+            return await self._patch_loop(
+                original_messages=messages,
+                prev_dict=prev_dict,
+                validation_context=validation_context,
+                allow_re_extract=False,
+            )
+
+        parent_config: dict[str, Any] = {
+            **config,
+            "run_name": run_name or "stitcher",
+        }
+        return await RunnableLambda(_execute).ainvoke(None, config=parent_config)
 
     async def _patch_loop(
         self,
         *,
         original_messages: list[BaseMessage],
         prev_dict: dict[str, Any] | None,
-        run_name: str | None,
-        config: dict[str, Any],
         validation_context: ValidationContext | None,
         allow_re_extract: bool,
     ) -> Result:
         """Shared validate-and-patch loop for ``ainvoke`` and ``aupdate``.
+
+        Always runs INSIDE a ``RunnableLambda`` parent set up by ``ainvoke``
+        / ``aupdate`` — this means inner LLM calls inherit the parent run's
+        callbacks/tags/metadata/parent_run_id via LangChain's context vars,
+        so we only need to set ``run_name`` on each child config to
+        differentiate them in the trace tree.
 
         State machine on each iteration, driven by ``(prev_dict, last_error)``:
 
@@ -395,12 +420,11 @@ class Extractor:
         ``ainvoke`` enables it because only ``ainvoke`` has a fresh-extract
         path to fall back to.
         """
-        # Initial extract uses the bare base name; patch turns get a `.patch`
-        # suffix so retries are distinguishable in traces. Default base is
-        # `stitcher` when the caller doesn't supply one.
-        base_run_name = run_name or "stitcher"
-        initial_config: dict[str, Any] = {**config, "run_name": base_run_name}
-        patch_config: dict[str, Any] = {**config, "run_name": f"{base_run_name}.patch"}
+        # Child run names — just enough to distinguish initial extract from
+        # patch turns inside the parent trace. The user's run_name lives on
+        # the parent (set in ainvoke/aupdate), not on these children.
+        initial_config: dict[str, Any] = {"run_name": "initial"}
+        patch_config: dict[str, Any] = {"run_name": "patch"}
 
         raw_messages: list[BaseMessage] = list(original_messages)
         attempts = 0
@@ -502,6 +526,9 @@ class Extractor:
         patch_config: dict[str, Any],
         raw_messages: list[BaseMessage],
     ) -> tuple[dict[str, Any], BaseException | None]:
+        # patch_config carries only run_name ("patch") — callbacks, tags,
+        # metadata, and parent_run_id come from the surrounding RunnableLambda
+        # context set up by ainvoke/aupdate.
         """One patch turn: build the request, call the model, apply the patch.
 
         Returns ``(new_prev_dict, error)``. On success ``error`` is ``None`` and

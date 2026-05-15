@@ -75,9 +75,10 @@ async def test_arbitrary_config_kwarg_forwarded(fake_llm):
     assert fake_llm.initial_runnable.calls[0]["config"]["configurable"] == {"prompt_variant": "v3"}
 
 
-async def test_run_name_bare_on_initial_suffixed_on_patch_alongside_passthrough(fake_llm):
-    """``run_name`` lands bare on the initial extract and gets ``.patch``
-    suffixed for patch turns; tags/metadata sit alongside on both."""
+async def test_run_name_on_parent_children_named_initial_and_patch(fake_llm, capturing_callback):
+    """User's ``run_name`` is the parent run's name; children are uniformly
+    ``initial`` and ``patch``. Tags/metadata flow to both children via
+    LangChain context inheritance."""
     fake_llm.set_scripts(
         initial=[{"name": "Dave", "age": -1}],
         patch=[JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 18}])],
@@ -89,12 +90,15 @@ async def test_run_name_bare_on_initial_suffixed_on_patch_alongside_passthrough(
         run_name="batch_99",
         tags=["alpha"],
         metadata={"k": "v"},
+        callbacks=[capturing_callback],
     )
 
+    parent = next(e for e in capturing_callback.events if e["name"] == "batch_99")
+    assert parent["parent_run_id"] is None
     initial_cfg = fake_llm.initial_runnable.calls[0]["config"]
     patch_cfg = fake_llm.patch_runnable.calls[0]["config"]
-    assert initial_cfg["run_name"] == "batch_99"
-    assert patch_cfg["run_name"] == "batch_99.patch"
+    assert initial_cfg["run_name"] == "initial"
+    assert patch_cfg["run_name"] == "patch"
     assert initial_cfg["tags"] == ["alpha"] == patch_cfg["tags"]
     assert initial_cfg["metadata"] == {"k": "v"} == patch_cfg["metadata"]
 
@@ -119,18 +123,17 @@ async def test_aupdate_also_forwards_config(fake_llm):
     assert cfg["metadata"] == {"actor": "system"}
 
 
-async def test_callbacks_still_work_via_passthrough(fake_llm):
-    """Existing ``callbacks=[handler]`` call sites continue to function \u2014 the
-    callbacks kwarg simply lands in **config and gets forwarded identically."""
-    from langchain_core.callbacks import BaseCallbackHandler
-
-    class NoopHandler(BaseCallbackHandler):
-        pass
-
-    handler = NoopHandler()
+async def test_callbacks_reach_inner_calls(fake_llm, capturing_callback):
+    """User-supplied callbacks are attached to the parent and inherited by
+    inner calls via LangChain's context propagation — the callback receives
+    on_chain_start events for the parent run."""
     fake_llm.set_scripts(initial=[{"name": "Frank", "age": 22}], patch=[])
     extractor = Extractor(fake_llm, Person)
 
-    await extractor.ainvoke([], callbacks=[handler])
+    await extractor.ainvoke([], callbacks=[capturing_callback], run_name="X")
 
-    assert fake_llm.initial_runnable.calls[0]["config"]["callbacks"] == [handler]
+    # Parent chain start was observed (the user's callback fires for the
+    # RunnableLambda parent that wraps the patch loop).
+    assert any(
+        e["kind"] == "chain" and e["name"] == "X" for e in capturing_callback.events
+    )

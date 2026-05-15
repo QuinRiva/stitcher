@@ -15,10 +15,12 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables.config import ensure_config
 from pydantic import BaseModel
 
 
@@ -48,7 +50,15 @@ class _ScriptedRunnable(Runnable):
         if not self._script:
             raise AssertionError("scripted runnable exhausted; extractor called more times than expected")
         out = self._script.pop(0)
-        self.calls.append({"input": input, "config": dict(config or {})})
+        # ensure_config merges the explicit config arg with the LangChain
+        # context vars (parent run's callbacks, tags, metadata, etc.). Real
+        # Runnables do this implicitly via their default ainvoke; we have
+        # to do it explicitly because _ScriptedRunnable's ainvoke is custom.
+        # Without this the fake would only see what stitcher passed
+        # explicitly, missing context-inherited fields and breaking tests
+        # that verify the parent-runnable wrapping does its job.
+        merged = ensure_config(config)
+        self.calls.append({"input": input, "config": dict(merged)})
         return out
 
 
@@ -99,3 +109,32 @@ class FakeLLM(BaseChatModel):
 @pytest.fixture
 def fake_llm() -> FakeLLM:
     return FakeLLM()
+
+
+class CapturingCallback(BaseCallbackHandler):
+    """Records every chain/LLM start so tests can assert on the parent/child
+    run hierarchy stitcher establishes via its RunnableLambda wrapper.
+
+    Each event is a dict with ``name``, ``run_id``, ``parent_run_id`` so tests
+    can verify e.g. ``parent.name == 'my-pipeline'`` and ``child.parent_run_id
+    == parent.run_id``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def _record(self, kind: str, *, run_id, parent_run_id=None, name=None, **_kwargs) -> None:
+        self.events.append(
+            {"kind": kind, "name": name, "run_id": run_id, "parent_run_id": parent_run_id}
+        )
+
+    def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, name=None, **kwargs):
+        self._record("chain", run_id=run_id, parent_run_id=parent_run_id, name=name)
+
+    def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, name=None, **kwargs):
+        self._record("llm", run_id=run_id, parent_run_id=parent_run_id, name=name)
+
+
+@pytest.fixture
+def capturing_callback() -> CapturingCallback:
+    return CapturingCallback()

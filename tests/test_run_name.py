@@ -1,14 +1,17 @@
-"""``run_name`` kwarg threads through every stitcher LLM call.
+"""``run_name`` kwarg names the parent extraction run; child LLM calls are
+fixed-name (``initial`` / ``patch``) within the parent's trace.
 
-When set, both the initial extract and each patch turn use a name derived
-from the user-provided ``run_name``. When unset, stitcher falls back to
-its default names. This matters for langfuse trace differentiation when
-the same Extractor pattern is invoked from multiple call sites.
+Stitcher wraps each ``ainvoke``/``aupdate`` call in a ``RunnableLambda``
+so LangChain's callback machinery establishes a parent run that the
+initial extract and any patch turns become children of. The user's
+``run_name`` becomes the parent's name; children are always ``initial``
+and ``patch``. This ensures one Langfuse trace per ainvoke (rather than
+N separate traces, which is what stitcher used to produce).
 """
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from stitcher import Extractor
 from stitcher.extractor import JsonPatchResponse
@@ -28,46 +31,60 @@ class Person(BaseModel):
         return self
 
 
-async def test_run_name_threads_to_initial_call(fake_llm):
-    """``run_name='X'`` causes the initial extract to be named ``X.initial``."""
+async def test_run_name_becomes_parent_name_initial_child_is_named_initial(
+    fake_llm, capturing_callback
+):
+    """``run_name='X'`` names the parent run ``X``; the initial extract child is named ``initial``."""
     fake_llm.set_scripts(
         initial=[{"name": "Alice", "age": 30}],
         patch=[],
     )
     extractor = Extractor(fake_llm, Person)
 
-    result = await extractor.ainvoke([], run_name="my-pipeline.extract_person")
+    result = await extractor.ainvoke(
+        [], run_name="my-pipeline.extract_person", callbacks=[capturing_callback]
+    )
 
     assert result.value == Person(name="Alice", age=30)
-    assert len(fake_llm.initial_runnable.calls) == 1
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "my-pipeline.extract_person"
+    # Parent run carries the user's run_name; it has no parent of its own.
+    parent = next(
+        e for e in capturing_callback.events if e["name"] == "my-pipeline.extract_person"
+    )
+    assert parent["parent_run_id"] is None
+    # Inner extract is the fixed child name "initial" — names are
+    # differentiators within the parent trace, not standalone trace names.
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "initial"
 
 
-async def test_run_name_threads_to_patch_calls(fake_llm):
-    """Each patch turn is named ``{run_name}.patch``, regardless of how many."""
+async def test_patch_turns_are_named_patch_within_parent(fake_llm, capturing_callback):
+    """Patch turns are children named ``patch`` (regardless of how many);
+    the user's ``run_name`` lives on the parent."""
     fake_llm.set_scripts(
-        initial=[{"name": "Bob", "age": -5}],   # fails validation
+        initial=[{"name": "Bob", "age": -5}],
         patch=[
-            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),  # still fails
-            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),   # passes
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": -1}]),
+            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 7}]),
         ],
     )
     extractor = Extractor(fake_llm, Person, max_attempts=5)
 
-    result = await extractor.ainvoke([], run_name="batch_42")
+    result = await extractor.ainvoke(
+        [], run_name="batch_42", callbacks=[capturing_callback]
+    )
 
     assert result.value == Person(name="Bob", age=7)
-    assert result.attempts == 3  # initial + 2 patches
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "batch_42"
+    assert result.attempts == 3
+    parent = next(e for e in capturing_callback.events if e["name"] == "batch_42")
+    assert parent["parent_run_id"] is None
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "initial"
     assert len(fake_llm.patch_runnable.calls) == 2
     for call in fake_llm.patch_runnable.calls:
-        assert call["config"]["run_name"] == "batch_42.patch"
+        assert call["config"]["run_name"] == "patch"
 
 
-async def test_run_name_default_when_unset(fake_llm):
-    """When ``run_name`` is not provided, the base name defaults to
-    ``stitcher``: initial extract is ``stitcher`` (bare), patch turns are
-    ``stitcher.patch``."""
+async def test_run_name_default_when_unset(fake_llm, capturing_callback):
+    """When ``run_name`` is not provided, parent defaults to ``stitcher``
+    and children remain ``initial`` / ``patch``."""
     fake_llm.set_scripts(
         initial=[{"name": "Carol", "age": -1}],
         patch=[
@@ -76,8 +93,10 @@ async def test_run_name_default_when_unset(fake_llm):
     )
     extractor = Extractor(fake_llm, Person, max_attempts=3)
 
-    result = await extractor.ainvoke([])
+    result = await extractor.ainvoke([], callbacks=[capturing_callback])
 
     assert result.value == Person(name="Carol", age=99)
-    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "stitcher"
-    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "stitcher.patch"
+    parent = next(e for e in capturing_callback.events if e["name"] == "stitcher")
+    assert parent["parent_run_id"] is None
+    assert fake_llm.initial_runnable.calls[0]["config"]["run_name"] == "initial"
+    assert fake_llm.patch_runnable.calls[0]["config"]["run_name"] == "patch"
