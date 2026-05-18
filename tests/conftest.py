@@ -24,16 +24,32 @@ from langchain_core.runnables.config import ensure_config
 from pydantic import BaseModel
 
 
+# Sentinel keys used to recognise a pre-built include_raw envelope. Any
+# scripted output whose top-level keys are exactly this set is treated as
+# already-wrapped and returned verbatim; everything else is auto-wrapped
+# into the same envelope so tests that don't care about raw/parsing_error
+# can keep writing terse dict/BaseModel scripts.
+_INCLUDE_RAW_KEYS = frozenset({"raw", "parsed", "parsing_error"})
+
+
 class _ScriptedRunnable(Runnable):
     """A Runnable that returns scripted outputs in order, recording each call's
     config so tests can assert what stitcher passed.
 
-    Each scripted output is either:
-    - a dict (returned as-is — simulates the JSON-mode initial extract path
-      where ``with_structured_output(schema=dict)`` returns a parsed dict), or
-    - a Pydantic ``BaseModel`` instance (returned as-is — simulates the patch
-      path where ``with_structured_output(schema=JsonPatchResponse)`` returns
-      a ``JsonPatchResponse``).
+    Stitcher binds ``with_structured_output(..., include_raw=True)`` on both
+    extractors, so the real return shape is
+    ``{"raw": AIMessage, "parsed": <dict | BaseModel>, "parsing_error":
+    BaseException | None}``. Tests can drive this directly by scripting that
+    exact dict, or they can stay terse by scripting just the ``parsed``
+    payload (a dict for the initial path, a ``JsonPatchResponse`` for the
+    patch path) — in that case the runnable auto-wraps with a synthesized
+    ``AIMessage`` (empty ``usage_metadata``, content = JSON dump of the
+    payload) and ``parsing_error=None``.
+
+    To exercise parsing_error semantics, script a full envelope dict with
+    ``parsing_error`` set; to exercise token aggregation, script a full
+    envelope dict with a real ``AIMessage(usage_metadata=...)`` under
+    ``raw``.
 
     If the script runs out, ``ainvoke`` raises ``AssertionError`` so an
     over-eager extractor doesn't silently re-use the last output.
@@ -59,7 +75,25 @@ class _ScriptedRunnable(Runnable):
         # that verify the parent-runnable wrapping does its job.
         merged = ensure_config(config)
         self.calls.append({"input": input, "config": dict(merged)})
+        return _wrap_include_raw(out)
+
+
+def _wrap_include_raw(out: Any) -> dict[str, Any]:
+    """Return ``out`` if it already looks like an include_raw envelope, else
+    wrap it as a successful one."""
+    if isinstance(out, dict) and frozenset(out.keys()) == _INCLUDE_RAW_KEYS:
         return out
+    if isinstance(out, BaseModel):
+        content = out.model_dump_json()
+    else:
+        # dict (initial-extract path) or anything else JSON-serialisable
+        import json
+        content = json.dumps(out)
+    return {
+        "raw": AIMessage(content=content),
+        "parsed": out,
+        "parsing_error": None,
+    }
 
 
 class FakeLLM(BaseChatModel):

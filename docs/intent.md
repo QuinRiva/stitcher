@@ -63,7 +63,7 @@ result = await extractor.aupdate(existing=prior,
                                  run_name="my_call_site")
 
 # result.value : MySchema (validated)
-# result.attempts, result.was_re_extracted, result.raw_messages
+# result.attempts, result.was_re_extracted, result.raw_messages, result.metadata
 ```
 
 `ainvoke` does exactly four things:
@@ -149,22 +149,107 @@ Fires at three points inside the patch loop:
 Sync (`def`) and async (`async def`) callables both work; stitcher
 awaits if the return is a coroutine.
 
-Two deliberate divergences from trustcall, both for the same reason —
-stitcher passes the consumer the real underlying object rather than a
-flattened/synthesized stand-in:
+One deliberate divergence from trustcall:
 
-- `AttemptInfo` does **not** carry an `ai_message` field. Stitcher uses
-  `with_structured_output()`, which returns a parsed dict and hides the
-  underlying `AIMessage` — synthesizing a fake one would lose
-  `response_metadata` / `usage_metadata` and silently break callers who
-  depend on them. If you need raw response metadata (token counts,
-  finish_reason, etc.), pass a `BaseCallbackHandler` via `callbacks=`
-  instead.
 - `AttemptInfo.error` is a raw `BaseException`, not a `list[str]` of
   pre-formatted messages. Adjudicators classify failures by structured
   fields (`type`, `loc`, `ctx["error"]`) — stitcher pre-formatting to
   strings would throw away the structure right where the consumer needs
   it. Format however your wide-log expects.
+
+`AttemptInfo` deliberately does **not** carry an `ai_message` field even
+though stitcher now binds `with_structured_output(..., include_raw=True)`
+and has the real `AIMessage` for every call. The per-attempt AIMessages
+are available on `Result.raw_messages` in order; the aggregated headline
+numbers (initial / total token usage, duration) are on `Result.metadata`.
+Duplicating them on `AttemptInfo` would be redundant API surface for what
+an `on_attempt` consumer can already correlate by sequence number.
+
+## Result metadata (aggregated observability)
+
+Every successful `ainvoke` / `aupdate` returns `Result.metadata` of type
+`Metadata(initial: TokenUsage, total: TokenUsage, duration_seconds: float)`.
+
+`TokenUsage` carries `input_tokens`, `cached_input_tokens` (subset of
+input, populated when the provider bills cached reads),
+`reasoning_tokens` (subset of underlying output, populated on Gemini
+thinking / OpenAI o-series), and `output_payload_tokens` (output minus
+reasoning — the user-visible response payload). The subset semantics
+(cache and reasoning are breakdowns of their parent totals, not
+additive) match LangChain's `UsageMetadata` convention.
+
+`initial` aggregates only the *first happy-path AIMessage* — the call
+whose output seeded `Result.value` (the initial extract for `ainvoke`,
+or the first successfully-applied patch for `aupdate`; the discarded
+first extract after a catastrophic-re-extract or parse-failure-re-extract
+is not counted). `total` aggregates every AIMessage stitcher emitted,
+including discarded ones. `total - initial` is the repair/retry cost.
+
+Output-payload size shortcut: if `Result.attempts == 1` on an `ainvoke`
+call, `metadata.initial.output_payload_tokens` IS the token size of
+`Result.value` as the model emitted it. In every other case (`attempts >
+1` on `ainvoke`, or any `aupdate`), the field reflects the seed extract
+/ first applied patch envelope and is *not* the size of `Result.value`;
+for that, tokenize `Result.value.model_dump_json()` with your provider's
+tokenizer.
+
+`duration_seconds` is wall time of the whole patch loop (covers every
+LLM call, normaliser pass, and validation pass; excludes the
+`Result`/`Metadata` construction below it).
+
+### Deferred metadata fields
+
+The following counters are *not* exposed today but are an explicitly
+considered future addition:
+
+- `num_validation_failures: int` — ValidationErrors that fed back into
+  the patch loop
+- `num_patch_apply_failures: int` — `jsonpatch.apply` rejected the ops
+- `num_parse_failures: int` — LangChain `parsing_error` fired (initial
+  or patch path)
+
+The rationale for deferring: they are all derivable today by passing an
+`on_attempt` callable and counting. They would be cheap to add and
+genuinely useful for wide-log dashboards ("this prompt has a 30%
+patch-apply-failure rate, time to swap models"), but adding them now
+without a concrete consumer would be metadata creep. If a real pipeline
+shows up that wants them as headline numbers rather than via
+`on_attempt`, add them; until then, `on_attempt` covers the need.
+
+## Parsing-error handling (LangChain include_raw)
+
+With `include_raw=True`, LangChain returns `{"raw": AIMessage, "parsed":
+..., "parsing_error": BaseException | None}` from each structured-output
+call. `parsing_error` fires when the model's response can't be coerced
+into the bound schema — typically because it emitted prose instead of
+JSON in `method="json_schema"` mode, or (on the patch path) emitted
+JSON that didn't match the `{reasoning, operations}` shape required by
+`JsonPatchResponse`.
+
+Stitcher treats `parsing_error` symmetrically with its existing failure
+modes:
+
+- **Initial extract parsing_error** is analogous to a catastrophic-weight
+  `ValidationError`: the seed is unusable, discard it, consume an attempt,
+  re-extract on the next iteration. `was_re_extracted` flips to True —
+  the public meaning is "we threw away an extract and tried again,"
+  which both the weight-overflow and parse-failure paths satisfy.
+  Only reachable from `ainvoke` (`aupdate` never enters the initial-extract
+  branch); if a future caller threads `allow_re_extract=False` through
+  with an initial extract, the error is raised rather than looped on.
+- **Patch turn parsing_error** is analogous to a `jsonpatch.apply`
+  rejection: the patch envelope is unusable, the *previous* state is
+  preserved, an attempt is consumed, the model is given corrective
+  feedback ("your response didn't match the required shape, reissue"),
+  and the loop retries. The malformed `AIMessage` is still appended to
+  `raw_messages` so the caller can see what the model emitted.
+
+The design principle: stitcher's job is to ensure the LLM provides a
+valid response to a valid request. Bailing out on the first intermittent
+parse failure contradicts that mission; treating it as another flavour
+of "the model produced something useless" and retrying within the same
+attempt budget is consistent with how every other LLM-emission failure
+mode is handled.
 
 ## What stitcher is **not**
 

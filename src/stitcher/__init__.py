@@ -6,17 +6,22 @@ from stitcher.exceptions import AggregatedValidationError
 from stitcher.extractor import (
     AttemptInfo,
     Extractor,
+    Metadata,
     OnAttempt,
     Result,
+    TokenUsage,
     ValidationContext,
 )
 
 __all__ = [
     "Extractor",
     "Result",
+    "Metadata",
+    "TokenUsage",
     "AggregatedValidationError",
     "AttemptInfo",
     "OnAttempt",
     "ValidationContext",
 ]
-__version__ = "0.0.11"
+__version__ = "0.0.12"
+

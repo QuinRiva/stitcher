@@ -79,8 +79,13 @@ print(result.was_re_extracted)
      and the validation errors, asking for a JSON Patch back. Apply the
      patch via the `jsonpatch` library, re-validate, repeat.
 4. Bounded by `max_attempts`. Returns a `Result(value, attempts,
-   was_re_extracted, raw_messages)` on success; raises `RuntimeError` on
-   exhaustion.
+   was_re_extracted, raw_messages, metadata)` on success; raises
+   `RuntimeError` on exhaustion. `raw_messages` carries the real LangChain
+   `AIMessage`s (with `usage_metadata`, `response_metadata`, `finish_reason`,
+   etc. populated by the provider — stitcher binds
+   `with_structured_output(..., include_raw=True)`). `metadata` is an
+   aggregated headline of token usage and wall time: see `Metadata` /
+   `TokenUsage` in `stitcher.extractor` for the field-by-field contract.
 
 The repair loop uses no `tool_calls` and no `tool_call_id` correlation —
 it's a pure conversation history of `[system, user, AIMessage(prev_json),
