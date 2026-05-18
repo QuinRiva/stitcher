@@ -253,25 +253,43 @@ class Result(NamedTuple):
 # The caller's messages own the *what* (extraction prompt for ainvoke,
 # update intent for aupdate); this template owns the *how*. The detailed
 # format and ops rules live on JsonPatchResponse's field descriptions,
-# which the model sees as part of the structured-output binding.
+# which the model sees as part of the structured-output binding — NOT
+# duplicated here, by design (see commit d947c0e).
+#
+# Markdown structure: ``## Headings``, ``---`` separators, and
+# ```` ```json ``` ```` code fences render natively in Langfuse and
+# similar trace viewers, so a human reading a stuck-patch trial can scan
+# the sections at a glance instead of squinting at XML-style tags.
+#
+# Schema is dumped as compact (no indent) JSON: the model handles it fine
+# and the trace panel doesn't waste vertical space on a multi-line dump
+# the human almost never needs to eyeball. Copy-paste into a JSON
+# formatter if you do.
 #
 # prev_dict is NOT embedded here — it lives in the AIMessage immediately
 # above this HumanMessage in patch_history. The two are contiguous so the
-# model has full attention on it; embedding it again as a `<previous>`
-# block was pure duplication and burned tokens for no benefit.
+# model has full attention on it; embedding it again would burn tokens
+# for no benefit.
 _PATCH_PROMPT_TEMPLATE = (
-    "The patched output must conform to this target schema:\n\n"
-    "<schema>\n{schema}\n</schema>\n\n"
+    "## Target Schema\n\n"
+    "The patched output must conform to:\n\n"
+    "```json\n{schema}\n```\n\n"
+    "---\n\n"
+    "## Instructions\n\n"
     "Produce a JSON Patch against your previous output (the assistant "
-    "message above). Return reasoning then operations — their format "
-    "and ops rules are in the structured-output schema."
+    "message immediately above). Return `reasoning` then `operations` — "
+    "their format and ops rules are in the structured-output schema.\n"
 )
 
 # Prepended to the body when stitcher owns the *what* — i.e. when the
 # trigger is an internal validator failure rather than a user-supplied intent.
 _PATCH_REPAIR_PREFIX = (
-    "Your previous JSON output failed validation.\n\n"
-    "<errors>\n{errors}\n</errors>\n\n"
+    "## Validation Errors\n\n"
+    "The previous JSON output failed validation. The errors below are "
+    "symptoms — diagnose what your previous output got wrong, then patch "
+    "the root cause, not just the surface message.\n\n"
+    "```\n{errors}\n```\n\n"
+    "---\n\n"
 )
 
 
@@ -953,7 +971,7 @@ def _build_patch_prompt(
     embedding it again would just burn tokens for no attention benefit.
     """
     body = _PATCH_PROMPT_TEMPLATE.format(
-        schema=json.dumps(schema_json, indent=2),
+        schema=json.dumps(schema_json),
     )
     if error is None:
         return body

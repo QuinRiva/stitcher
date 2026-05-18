@@ -95,8 +95,8 @@ def test_build_patch_prompt_no_previous_block():
         schema_json={"type": "object"},
     )
     assert "<previous>" not in prompt
-    assert "<schema>" in prompt
-    assert "the assistant message above" in prompt
+    assert "## Target Schema" in prompt
+    assert "the assistant message immediately above" in prompt
 
 
 def test_build_patch_prompt_repair_uses_new_error_format():
@@ -111,7 +111,8 @@ def test_build_patch_prompt_repair_uses_new_error_format():
     except ValidationError as e:
         prompt = _build_patch_prompt(error=e, schema_json={"type": "object"})
 
-    assert "Your previous JSON output failed validation" in prompt
+    assert "failed validation" in prompt
+    assert "## Validation Errors" in prompt
     assert "[1]" in prompt
     assert "/age" in prompt
     # Confirm we're NOT using json.dumps — no stray quoted keys

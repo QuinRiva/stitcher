@@ -6,7 +6,7 @@ Behavioural contract (mirrors the docstring on ``Extractor.aupdate``):
   for "existing already validates" — that would conflate update with
   verify-and-repair.
 - The initial JSON-mode extract is **never** called.
-- The first patch turn carries no validator framing (no ``<errors>`` block,
+- The first patch turn carries no validator framing (no ``## Validation Errors`` section,
   no "your previous output failed validation" prefix). The user's update
   intent in ``messages`` directs *what* to patch; the prompt only specifies
   *how*.
@@ -82,10 +82,10 @@ async def test_aupdate_first_turn_prompt_has_no_repair_prefix(fake_llm):
     # in 0.0.11).
     sent_input = fake_llm.patch_runnable.calls[0]["input"]
     patch_prompt = sent_input[-1].content
-    assert "<schema>" in patch_prompt
+    assert "## Target Schema" in patch_prompt
     assert "<previous>" not in patch_prompt
     assert "failed validation" not in patch_prompt
-    assert "<errors>" not in patch_prompt
+    assert "## Validation Errors" not in patch_prompt
     # And the prev_dict really is in the AIMessage above (so the model has
     # something to patch against).
     prev_msg = sent_input[-2]
@@ -120,8 +120,8 @@ async def test_aupdate_retry_uses_repair_prefix(fake_llm):
 
     # Second turn: repair prefix present (validator-driven retry).
     second_prompt = fake_llm.patch_runnable.calls[1]["input"][-1].content
-    assert "Your previous JSON output failed validation" in second_prompt
-    assert "<errors>" in second_prompt
+    assert "failed validation" in second_prompt
+    assert "## Validation Errors" in second_prompt
 
 
 async def test_aupdate_accepts_pydantic_instance(fake_llm):
@@ -211,8 +211,15 @@ async def test_aupdate_first_turn_prompt_embeds_target_schema(fake_llm):
     # Schema content present (Pydantic emits the field names verbatim)
     assert '"name"' in patch_prompt
     assert '"age"' in patch_prompt
-    # Wrapped in the <schema> block, not just leaked elsewhere
-    schema_start = patch_prompt.find("<schema>")
-    schema_end = patch_prompt.find("</schema>")
-    assert schema_start < schema_end
-    assert '"name"' in patch_prompt[schema_start:schema_end]
+    # Wrapped in the ``## Target Schema`` section's ```json fence, not
+    # just leaked elsewhere
+    schema_start = patch_prompt.find("## Target Schema")
+    fence_start = patch_prompt.find("```json", schema_start)
+    fence_end = patch_prompt.find("```", fence_start + len("```json"))
+    assert schema_start < fence_start < fence_end
+    assert '"name"' in patch_prompt[fence_start:fence_end]
+    # Compact JSON — no indent=2 multi-line dump
+    json_block = patch_prompt[fence_start + len("```json"):fence_end].strip()
+    assert "\n" not in json_block, (
+        f"schema should be compact single-line JSON, got:\n{json_block!r}"
+    )
