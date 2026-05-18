@@ -361,16 +361,28 @@ class Extractor:
         # loop logic and appends "raw" to raw_messages — same position as the
         # synthesized AIMessage used to occupy, now with the real metadata
         # attached. See ``_aggregate_usage`` for how metadata is rolled up.
+        #
+        # ``langsmith:hidden`` tag demotes the LangChain include_raw plumbing
+        # (RunnableSequence / RunnableParallel<raw> / RunnableWithFallbacks /
+        # RunnableAssign / JsonOutputParser / internal RunnableLambdas) to
+        # ``level="DEBUG"`` in Langfuse, which the Langfuse trace UI hides by
+        # default. The actual LLM generation is structurally exempt from the
+        # demotion (Langfuse's ``__on_llm_action`` doesn't apply level-from-tags),
+        # so the model call stays at DEFAULT and visible. The user-meaningful
+        # ``initial`` / ``patch`` labels also stay visible because they sit on
+        # outer ``RunnableLambda`` wrappers in ``_patch_loop`` and
+        # ``_run_patch_turn`` that are NOT tagged hidden. See
+        # https://github.com/langfuse/langfuse-python/pull/1077.
         self._initial_llm = llm.with_structured_output(
             schema=self._schema_json,
             method="json_schema",
             include_raw=True,
-        )
+        ).with_config(tags=["langsmith:hidden"])
         self._patch_llm = llm.with_structured_output(
             schema=JsonPatchResponse,
             method="json_schema",
             include_raw=True,
-        )
+        ).with_config(tags=["langsmith:hidden"])
 
     async def ainvoke(
         self,
@@ -569,7 +581,12 @@ class Extractor:
         """
         # Child run names — just enough to distinguish initial extract from
         # patch turns inside the parent trace. The user's run_name lives on
-        # the parent (set in ainvoke/aupdate), not on these children.
+        # the parent (set in ainvoke/aupdate), not on these children. Each
+        # child name is set on a thin ``RunnableLambda`` wrapper around the
+        # LLM call (see ``_invoke_initial`` / ``_invoke_patch`` below) so the
+        # label sits at Langfuse's DEFAULT level — visible — while the
+        # ``langsmith:hidden``-tagged ``with_structured_output`` plumbing
+        # underneath collapses to DEBUG.
         initial_config: dict[str, Any] = {"run_name": "initial"}
         patch_config: dict[str, Any] = {"run_name": "patch"}
 
@@ -584,9 +601,8 @@ class Extractor:
             attempts += 1
 
             if prev_dict is None:
-                init_result = await self._initial_llm.ainvoke(
-                    original_messages,
-                    config=initial_config,
+                init_result = await self._invoke_initial(
+                    original_messages, initial_config
                 )
                 init_raw: AIMessage = init_result["raw"]
                 raw_messages.append(init_raw)
@@ -681,6 +697,40 @@ class Extractor:
             f"Last validation error: {last_validation_error!r}"
         )
 
+    async def _invoke_initial(
+        self,
+        messages: list[BaseMessage],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke the initial-extract chain inside a thin labeling wrapper.
+
+        The wrapper exists solely to put the user-meaningful ``initial`` label
+        at Langfuse's DEFAULT level (visible). Without it, the label would
+        attach to the outermost span of the ``with_structured_output`` chain,
+        which is tagged ``langsmith:hidden`` and so renders at DEBUG (hidden
+        by default in Langfuse's trace UI). We also re-pass ``config`` to the
+        inner ``ainvoke`` so the per-call run_name reaches the LLM via
+        context vars (the FakeLLM-based tests assert on this).
+        """
+        async def _step(msgs: list[BaseMessage]) -> dict[str, Any]:
+            return await self._initial_llm.ainvoke(msgs, config=config)
+        return await RunnableLambda(_step).ainvoke(messages, config=config)
+
+    async def _invoke_patch(
+        self,
+        history: list[BaseMessage],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke the patch chain inside a thin labeling wrapper.
+
+        Mirror of ``_invoke_initial`` for the patch path — same reason, same
+        shape. The wrapper keeps the ``patch`` label visible at DEFAULT level
+        in Langfuse while the include_raw plumbing underneath stays hidden.
+        """
+        async def _step(hist: list[BaseMessage]) -> dict[str, Any]:
+            return await self._patch_llm.ainvoke(hist, config=config)
+        return await RunnableLambda(_step).ainvoke(history, config=config)
+
     async def _fire_attempt(
         self,
         attempt_number: int,
@@ -739,10 +789,7 @@ class Extractor:
             patch_msg,
         ]
         raw_messages.append(patch_msg)
-        patch_result = await self._patch_llm.ainvoke(
-            patch_history,
-            config=patch_config,
-        )
+        patch_result = await self._invoke_patch(patch_history, patch_config)
         patch_raw: AIMessage = patch_result["raw"]
         raw_messages.append(patch_raw)
         parse_error = patch_result["parsing_error"]

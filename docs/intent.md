@@ -216,6 +216,65 @@ without a concrete consumer would be metadata creep. If a real pipeline
 shows up that wants them as headline numbers rather than via
 `on_attempt`, add them; until then, `on_attempt` covers the need.
 
+## Langfuse trace shape
+
+Asking LangChain for ``with_structured_output(..., include_raw=True)`` returns
+the real ``AIMessage`` (with ``usage_metadata`` / ``response_metadata`` /
+``finish_reason``) but expands a single LLM call into a tree of internal
+runnables: ``RunnableSequence`` → ``RunnableParallel<raw>`` →
+``RunnableWithFallbacks`` → ``RunnableAssign<parsed, parsing_error>`` →
+``RunnableParallel<parsed, parsing_error>`` → (``JsonOutputParser`` and a
+couple of internal ``RunnableLambda``s). For pipelines that view their traces
+in Langfuse, this is noise — a single LLM step rendered as ~7 nested spans.
+
+Stitcher tags the ``with_structured_output`` chains with
+``langsmith:hidden`` (a tag the Langfuse Python SDK honors, per
+langfuse-python PR #1077). Effect:
+
+- Each tagged chain/parser/lambda span is exported with
+  ``level="DEBUG"``. Langfuse's trace UI hides DEBUG observations by
+  default and shows them under a "N hidden observations — show all"
+  toggle. Storage is unchanged; only the default view is collapsed.
+- The actual LLM generation is structurally exempt from the demotion
+  (Langfuse's ``__on_llm_action`` doesn't apply level-from-tags). The
+  model call stays at the default level and visible — you still see
+  one generation span per LLM round-trip, with its full prompt /
+  response / token usage.
+- The user-meaningful ``initial`` / ``patch`` labels stay visible: they
+  sit on outer ``RunnableLambda`` wrappers (one extra thin span per
+  call, named for the step) that are NOT tagged hidden. Without them,
+  the labels would attach to the outermost span of the hidden chain
+  and disappear into DEBUG with the rest of it.
+- Tag propagation goes parent → children only. Anything wrapping
+  stitcher from outside (your LangGraph nodes, pipeline-level
+  wrappers, etc.) is unaffected.
+
+Resulting Langfuse tree for a 3-attempt ``ainvoke`` (initial + 2 patches):
+
+```
+stitcher                            ← DEFAULT, visible (parent wrapper, user's run_name)
+├── initial                         ← DEFAULT, visible (thin labeling lambda)
+│   └── [ChatGoogleGenerativeAI]    ← DEFAULT, visible (LLM call)
+├── patch                           ← DEFAULT, visible
+│   └── [ChatGoogleGenerativeAI]    ← DEFAULT, visible
+└── patch                           ← DEFAULT, visible
+    └── [ChatGoogleGenerativeAI]    ← DEFAULT, visible
+```
+
+If you need to see the hidden plumbing (e.g. debugging a parsing-error
+edge case), toggle the trace UI's log-level filter to ``DEFAULT`` to
+reveal the suppressed nodes. They're still there, just collapsed by
+default.
+
+Version dependency: the ``langsmith:hidden`` recognition landed in
+langfuse-python PR #1077. Older Langfuse SDKs ignore the tag (no harm —
+the trace just stays noisy as it was before). Confirm with:
+
+```bash
+python -c "from langfuse.langchain import CallbackHandler; \
+  import inspect; print('LANGSMITH_TAG_HIDDEN' in inspect.getsource(CallbackHandler))"
+```
+
 ## Parsing-error handling (LangChain include_raw)
 
 With `include_raw=True`, LangChain returns `{"raw": AIMessage, "parsed":
