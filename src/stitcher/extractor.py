@@ -36,13 +36,20 @@ import json
 import time
 import types
 from collections.abc import Awaitable
-from typing import Any, Callable, NamedTuple, TypeAlias, Union, get_args, get_origin
+from typing import Any, Callable, TypeAlias, Union, get_args, get_origin
 
 import jsonpatch
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    ValidationError,
+    field_serializer,
+)
 
 from stitcher.exceptions import AggregatedValidationError
 
@@ -50,15 +57,18 @@ from stitcher.exceptions import AggregatedValidationError
 ValidationContext: TypeAlias = dict[str, Any]
 
 
-class AttemptInfo(NamedTuple):
+class AttemptInfo(BaseModel):
     """Per-attempt observability payload, fired by ``Extractor.on_attempt``.
 
     Diverges from trustcall's ``AttemptInfo`` in one place — ``error: BaseException
     | None`` instead of ``validation_errors: list[str]``. Adjudicators classify
     failures by ``error.errors()`` structure (``type``, ``loc``, ``ctx["error"]``
     for nested ``AggregatedValidationError``) — stitcher pre-formatting to strings
-    would throw away the structure right where the consumer needs it. Format the
-    exception however your wide-log expects.
+    would throw away the structure right where the consumer needs it. In-memory
+    you get the live exception; ``model_dump()`` projects it to
+    ``{"type": ..., "errors": ...}`` for Pydantic ``ValidationError`` (preserving
+    the structured payload adjudicators key off) and ``{"type": ..., "message":
+    ...}`` otherwise, so wide-logs serialise without bespoke helpers.
 
     Per-attempt token usage / finish_reason / provider metadata are available via
     ``Result.raw_messages`` (which carries the real LangChain ``AIMessage``s
@@ -79,10 +89,20 @@ class AttemptInfo(NamedTuple):
             patch-apply or patch-response-shape failure, ``None`` on success.
         is_success: convenience boolean (equivalent to ``error is None``).
     """
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
     attempt_number: int
     parsed: dict[str, Any] | None
     error: BaseException | None
     is_success: bool
+
+    @field_serializer("error")
+    def _serialize_error(self, e: BaseException | None) -> dict[str, Any] | None:
+        if e is None:
+            return None
+        if isinstance(e, ValidationError):
+            return {"type": "ValidationError", "errors": e.errors()}
+        return {"type": type(e).__name__, "message": str(e)}
 
 
 # Both sync (returns None) and async (returns Awaitable[None]) callables
@@ -165,7 +185,7 @@ class JsonPatchResponse(BaseModel):
     )
 
 
-class TokenUsage(NamedTuple):
+class TokenUsage(BaseModel):
     """Aggregated token counts over one or more LLM calls.
 
     Fields:
@@ -192,13 +212,15 @@ class TokenUsage(NamedTuple):
             slice of output; for non-thinking models this equals
             ``output_tokens`` verbatim.
     """
+    model_config = ConfigDict(frozen=True)
+
     input_tokens: int
     cached_input_tokens: int
     reasoning_tokens: int
     output_payload_tokens: int
 
 
-class Metadata(NamedTuple):
+class Metadata(BaseModel):
     """Aggregated observability headline numbers attached to ``Result``.
 
     Fields:
@@ -235,14 +257,24 @@ class Metadata(NamedTuple):
         worth duplicating until a pipeline shows up that wants them as a
         wide-log signal.
     """
+    model_config = ConfigDict(frozen=True)
+
     initial: TokenUsage
     total: TokenUsage
     duration_seconds: float
 
 
-class Result(NamedTuple):
-    """Result of a successful ``ainvoke`` or ``aupdate`` call."""
-    value: BaseModel
+class Result(BaseModel):
+    """Result of a successful ``ainvoke`` or ``aupdate`` call.
+
+    ``value`` is annotated ``SerializeAsAny[BaseModel]`` so that
+    ``Result.model_dump()`` emits the user schema's full field set, not just
+    the abstract ``BaseModel`` base (Pydantic v2's default is to serialise
+    against the declared type, which would strip every subclass field).
+    """
+    model_config = ConfigDict(frozen=True)
+
+    value: SerializeAsAny[BaseModel]
     attempts: int
     was_re_extracted: bool
     raw_messages: list[BaseMessage]
