@@ -52,6 +52,13 @@ scratch/
 private/
 internal/
 drafts/
+
+# Loose session scratch — presentation notes, research dumps, review drafts
+.presentation-*.md
+.review-*.md
+context.md
+research.md
+fix_slides.py
 *.private.*
 *.internal.*
 *.confidential.*
