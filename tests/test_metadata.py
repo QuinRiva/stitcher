@@ -16,8 +16,9 @@ Verifies:
   ``TokenUsage`` without raising \u2014 the ``usage_metadata is None`` path
   is exercised by every existing test, this just locks it in.
 
-Tests script the include_raw envelope explicitly when they need to attach
-``usage_metadata`` to drive the aggregation.
+Tests script an ``AIMessage`` explicitly when they need to attach
+``usage_metadata`` to drive the aggregation; stitcher self-parses its
+``content`` into the validated value.
 """
 from __future__ import annotations
 
@@ -52,13 +53,12 @@ def _envelope(
     output_tokens: int = 0,
     cache_read: int = 0,
     reasoning: int = 0,
-) -> dict:
-    """Build a successful include_raw envelope with the requested usage_metadata.
-
-    The ``raw`` AIMessage carries ``usage_metadata`` shaped per LangChain's
-    convention: top-level ``input_tokens``/``output_tokens``/``total_tokens``
-    plus optional ``input_token_details.cache_read`` and
-    ``output_token_details.reasoning`` subset breakdowns.
+) -> AIMessage:
+    """Build an ``AIMessage`` carrying ``parsed`` as JSON content plus the
+    requested ``usage_metadata`` (LangChain convention: top-level
+    ``input_tokens``/``output_tokens``/``total_tokens`` plus optional
+    ``input_token_details.cache_read`` and ``output_token_details.reasoning``
+    subset breakdowns). Stitcher parses the JSON content back into the value.
     """
     usage = {
         "input_tokens": input_tokens,
@@ -74,11 +74,7 @@ def _envelope(
         if isinstance(parsed, BaseModel)
         else __import__("json").dumps(parsed)
     )
-    return {
-        "raw": AIMessage(content=content, usage_metadata=usage),
-        "parsed": parsed,
-        "parsing_error": None,
-    }
+    return AIMessage(content=content, usage_metadata=usage)
 
 
 async def test_metadata_zero_when_no_usage_attached(fake_llm):
@@ -144,12 +140,11 @@ async def test_initial_skips_discarded_extract_on_re_extract(fake_llm):
     is the re-extract whose output actually seeded ``Result.value``."""
     fake_llm.set_scripts(
         initial=[
-            # discarded by parse-error path: 80 input / 5 output
-            {"raw": AIMessage(content="garbage",
-                              usage_metadata={"input_tokens": 80, "output_tokens": 5,
-                                              "total_tokens": 85}),
-             "parsed": None,
-             "parsing_error": ValueError("nope")},
+            # discarded by parse-error path: non-JSON content fails json.loads,
+            # surfacing parsing_error. 80 input / 5 output still count in total.
+            AIMessage(content="garbage",
+                      usage_metadata={"input_tokens": 80, "output_tokens": 5,
+                                      "total_tokens": 85}),
             # the successful re-extract that seeds the final value
             _envelope({"name": "Alice", "age": 30},
                       input_tokens=110, output_tokens=22),

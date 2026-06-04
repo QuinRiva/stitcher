@@ -24,32 +24,21 @@ from langchain_core.runnables.config import ensure_config
 from pydantic import BaseModel
 
 
-# Sentinel keys used to recognise a pre-built include_raw envelope. Any
-# scripted output whose top-level keys are exactly this set is treated as
-# already-wrapped and returned verbatim; everything else is auto-wrapped
-# into the same envelope so tests that don't care about raw/parsing_error
-# can keep writing terse dict/BaseModel scripts.
-_INCLUDE_RAW_KEYS = frozenset({"raw", "parsed", "parsing_error"})
-
-
 class _ScriptedRunnable(Runnable):
     """A Runnable that returns scripted outputs in order, recording each call's
     config so tests can assert what stitcher passed.
 
-    Stitcher binds ``with_structured_output(..., include_raw=True)`` on both
-    extractors, so the real return shape is
-    ``{"raw": AIMessage, "parsed": <dict | BaseModel>, "parsing_error":
-    BaseException | None}``. Tests can drive this directly by scripting that
-    exact dict, or they can stay terse by scripting just the ``parsed``
-    payload (a dict for the initial path, a ``JsonPatchResponse`` for the
-    patch path) — in that case the runnable auto-wraps with a synthesized
-    ``AIMessage`` (empty ``usage_metadata``, content = JSON dump of the
-    payload) and ``parsing_error=None``.
+    Stitcher now binds the JSON schema directly (``llm.bind(response_mime_type,
+    response_json_schema)``) and parses the returned ``AIMessage`` itself, so
+    this runnable returns a raw ``AIMessage`` — stitcher's ``_parse_content``
+    turns it into the ``{raw, parsed, parsing_error}`` envelope the loop
+    consumes. Tests stay terse by scripting just the payload:
 
-    To exercise parsing_error semantics, script a full envelope dict with
-    ``parsing_error`` set; to exercise token aggregation, script a full
-    envelope dict with a real ``AIMessage(usage_metadata=...)`` under
-    ``raw``.
+    - a ``dict`` (initial path) or a ``JsonPatchResponse`` (patch path) is
+      auto-wrapped into ``AIMessage(content=<json>)`` — the happy path.
+    - to exercise a parse / validation failure, script an ``AIMessage``
+      directly with malformed or non-conforming ``content``.
+    - to exercise token aggregation, script an ``AIMessage(usage_metadata=...)``.
 
     If the script runs out, ``ainvoke`` raises ``AssertionError`` so an
     over-eager extractor doesn't silently re-use the last output.
@@ -75,33 +64,25 @@ class _ScriptedRunnable(Runnable):
         # that verify the parent-runnable wrapping does its job.
         merged = ensure_config(config)
         self.calls.append({"input": input, "config": dict(merged)})
-        return _wrap_include_raw(out)
+        return _to_ai_message(out)
 
 
-def _wrap_include_raw(out: Any) -> dict[str, Any]:
-    """Return ``out`` if it already looks like an include_raw envelope, else
-    wrap it as a successful one."""
-    if isinstance(out, dict) and frozenset(out.keys()) == _INCLUDE_RAW_KEYS:
+def _to_ai_message(out: Any) -> AIMessage:
+    """Return ``out`` if it's already an ``AIMessage``, else wrap its JSON form."""
+    if isinstance(out, AIMessage):
         return out
     if isinstance(out, BaseModel):
-        content = out.model_dump_json()
-    else:
-        # dict (initial-extract path) or anything else JSON-serialisable
-        import json
-        content = json.dumps(out)
-    return {
-        "raw": AIMessage(content=content),
-        "parsed": out,
-        "parsing_error": None,
-    }
+        return AIMessage(content=out.model_dump_json())
+    import json
+    return AIMessage(content=json.dumps(out))
 
 
 class FakeLLM(BaseChatModel):
     """A minimal BaseChatModel whose ``with_structured_output`` returns
     ``_ScriptedRunnable`` instances controlled per-test.
 
-    Two scripts are tracked separately, mirroring the two ``with_structured_output``
-    calls stitcher makes in ``Extractor.__init__``:
+    Two scripts are tracked separately, mirroring the two schema bindings
+    stitcher makes in ``Extractor.__init__``:
 
     - ``initial_script`` \u2192 used by the ``self._initial_llm`` runnable
     - ``patch_script`` \u2192 used by the ``self._patch_llm`` runnable
@@ -124,16 +105,16 @@ class FakeLLM(BaseChatModel):
         # Required abstract method; we never use direct (non-structured) calls.
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=""))])
 
-    def with_structured_output(self, schema, *, method=None, **kwargs):  # type: ignore[override]
-        # Distinguish the two stitcher call sites by schema shape.
-        # Initial: ``schema`` is a dict (a JSON Schema). Patch: ``schema`` is
-        # the ``JsonPatchResponse`` Pydantic class.
-        if isinstance(schema, type) and issubclass(schema, BaseModel):
+    def bind(self, **kwargs):  # type: ignore[override]
+        # Stitcher binds each schema via ``llm.bind(response_mime_type=...,
+        # response_json_schema=...)``. Distinguish the two call sites by the
+        # bound schema's title: the patch turn binds ``JsonPatchResponse``.
+        schema = kwargs.get("response_json_schema") or {}
+        if schema.get("title") == "JsonPatchResponse":
             assert self.patch_runnable is not None, "test forgot to set patch script"
             return self.patch_runnable
-        else:
-            assert self.initial_runnable is not None, "test forgot to set initial script"
-            return self.initial_runnable
+        assert self.initial_runnable is not None, "test forgot to set initial script"
+        return self.initial_runnable
 
     def set_scripts(self, *, initial: list[Any] | None = None, patch: list[Any] | None = None) -> None:
         self.initial_runnable = _ScriptedRunnable(initial or [])

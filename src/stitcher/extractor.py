@@ -385,36 +385,30 @@ class Extractor:
         # API-level constraint and the model needs it inline to know what
         # shape it's patching toward.
         self._schema_json = schema.model_json_schema()
-        # include_raw=True returns {"raw": AIMessage, "parsed": ..., "parsing_error":
-        # ...} instead of the bare parsed value. This is the idiomatic LangChain
-        # path for keeping the real AIMessage (with usage_metadata,
-        # response_metadata, finish_reason, provider message id) while still
-        # getting the parsed structured output. Stitcher uses "parsed" for its
-        # loop logic and appends "raw" to raw_messages — same position as the
-        # synthesized AIMessage used to occupy, now with the real metadata
-        # attached. See ``_aggregate_usage`` for how metadata is rolled up.
-        #
-        # ``langsmith:hidden`` tag demotes the LangChain include_raw plumbing
-        # (RunnableSequence / RunnableParallel<raw> / RunnableWithFallbacks /
-        # RunnableAssign / JsonOutputParser / internal RunnableLambdas) to
-        # ``level="DEBUG"`` in Langfuse, which the Langfuse trace UI hides by
-        # default. The actual LLM generation is structurally exempt from the
-        # demotion (Langfuse's ``__on_llm_action`` doesn't apply level-from-tags),
-        # so the model call stays at DEFAULT and visible. The user-meaningful
-        # ``initial`` / ``patch`` labels also stay visible because they sit on
-        # outer ``RunnableLambda`` wrappers in ``_patch_loop`` and
-        # ``_run_patch_turn`` that are NOT tagged hidden. See
-        # https://github.com/langfuse/langfuse-python/pull/1077.
-        self._initial_llm = llm.with_structured_output(
-            schema=self._schema_json,
-            method="json_schema",
-            include_raw=True,
-        ).with_config(tags=["langsmith:hidden"])
-        self._patch_llm = llm.with_structured_output(
-            schema=JsonPatchResponse,
-            method="json_schema",
-            include_raw=True,
-        ).with_config(tags=["langsmith:hidden"])
+        # Bind the JSON schema straight onto the model (Gemini:
+        # ``response_mime_type="application/json"`` + ``response_json_schema``)
+        # and parse the raw AIMessage ourselves in ``_parse_content``. This is
+        # exactly what ``with_structured_output(method="json_schema")`` binds
+        # under the hood, minus its output-parser chain — so each LLM call is a
+        # SINGLE generation span in Langfuse (carrying the real
+        # ``usage_metadata`` / ``response_metadata`` / ``finish_reason`` on the
+        # AIMessage), instead of the ~7 nested runnables ``include_raw=True``
+        # expands one call into (RunnableSequence / RunnableParallel<raw> /
+        # RunnableWithFallbacks / RunnableAssign / JsonOutputParser / internal
+        # lambdas). Stitcher already owns validation + JSON-Patch repair, so
+        # owning the initial JSON parse too folds parse failures into the same
+        # repair loop and lets us drop the langfuse-version-coupled
+        # ``langsmith:hidden`` trace hack entirely. ``_parse_content`` returns
+        # the same ``{raw, parsed, parsing_error}`` envelope include_raw did,
+        # so the patch loop below is unchanged.
+        self._initial_llm = llm.bind(
+            response_mime_type="application/json",
+            response_json_schema=self._schema_json,
+        )
+        self._patch_llm = llm.bind(
+            response_mime_type="application/json",
+            response_json_schema=JsonPatchResponse.model_json_schema(),
+        )
 
     async def ainvoke(
         self,
@@ -613,12 +607,10 @@ class Extractor:
         """
         # Child run names — just enough to distinguish initial extract from
         # patch turns inside the parent trace. The user's run_name lives on
-        # the parent (set in ainvoke/aupdate), not on these children. Each
-        # child name is set on a thin ``RunnableLambda`` wrapper around the
-        # LLM call (see ``_invoke_initial`` / ``_invoke_patch`` below) so the
-        # label sits at Langfuse's DEFAULT level — visible — while the
-        # ``langsmith:hidden``-tagged ``with_structured_output`` plumbing
-        # underneath collapses to DEBUG.
+        # the parent (set in ainvoke/aupdate), not on these children. ``run_name``
+        # here names the LLM generation span itself (no wrapper span), so the
+        # Langfuse tree is one visible ``initial`` / ``patch`` generation per
+        # LLM round-trip.
         initial_config: dict[str, Any] = {"run_name": "initial"}
         patch_config: dict[str, Any] = {"run_name": "patch"}
 
@@ -734,34 +726,29 @@ class Extractor:
         messages: list[BaseMessage],
         config: dict[str, Any],
     ) -> dict[str, Any]:
-        """Invoke the initial-extract chain inside a thin labeling wrapper.
+        """Call the schema-bound model for the initial extract and self-parse.
 
-        The wrapper exists solely to put the user-meaningful ``initial`` label
-        at Langfuse's DEFAULT level (visible). Without it, the label would
-        attach to the outermost span of the ``with_structured_output`` chain,
-        which is tagged ``langsmith:hidden`` and so renders at DEBUG (hidden
-        by default in Langfuse's trace UI). We also re-pass ``config`` to the
-        inner ``ainvoke`` so the per-call run_name reaches the LLM via
-        context vars (the FakeLLM-based tests assert on this).
+        Returns the ``{raw, parsed, parsing_error}`` envelope the patch loop
+        consumes (``parsed`` is the raw dict here). ``config`` carries
+        ``run_name="initial"``, which names the generation span itself — no
+        wrapper span, so Langfuse shows one visible ``initial`` generation.
+        Callbacks / tags / metadata reach the call via context vars set by
+        the parent ``RunnableLambda`` in ``ainvoke`` / ``aupdate``.
         """
-        async def _step(msgs: list[BaseMessage]) -> dict[str, Any]:
-            return await self._initial_llm.ainvoke(msgs, config=config)
-        return await RunnableLambda(_step).ainvoke(messages, config=config)
+        raw = await self._initial_llm.ainvoke(messages, config=config)
+        return _parse_content(raw, model=None)
 
     async def _invoke_patch(
         self,
         history: list[BaseMessage],
         config: dict[str, Any],
     ) -> dict[str, Any]:
-        """Invoke the patch chain inside a thin labeling wrapper.
-
-        Mirror of ``_invoke_initial`` for the patch path — same reason, same
-        shape. The wrapper keeps the ``patch`` label visible at DEFAULT level
-        in Langfuse while the include_raw plumbing underneath stays hidden.
+        """Mirror of ``_invoke_initial`` for the patch path; parses the model's
+        JSON into a ``JsonPatchResponse`` (surfacing a ``parsing_error`` if it
+        doesn't match), and names the generation span ``patch``.
         """
-        async def _step(hist: list[BaseMessage]) -> dict[str, Any]:
-            return await self._patch_llm.ainvoke(hist, config=config)
-        return await RunnableLambda(_step).ainvoke(history, config=config)
+        raw = await self._patch_llm.ainvoke(history, config=config)
+        return _parse_content(raw, model=JsonPatchResponse)
 
     async def _fire_attempt(
         self,
@@ -846,6 +833,35 @@ class Extractor:
                 f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
                 "Re-issue a corrected patch against the previous JSON output."
             ), None
+
+def _parse_content(
+    raw: AIMessage, model: type[BaseModel] | None
+) -> dict[str, Any]:
+    """Parse a schema-bound model's JSON response into the include_raw envelope.
+
+    Stitcher binds the schema directly and parses here rather than delegating
+    to LangChain's ``with_structured_output`` parser chain, so each LLM call
+    stays a single Langfuse generation span. The returned shape
+    ``{raw, parsed, parsing_error}`` matches what ``include_raw=True`` used to
+    yield, so the patch loop is unchanged.
+
+    ``model=None`` (initial extract) returns the parsed dict. A BaseModel
+    subclass (patch turn) validates into that model. A JSON-decode failure or
+    a model-validation failure both surface as ``parsing_error`` — folded into
+    the patch loop exactly like LangChain's old ``parsing_error``.
+    """
+    text = raw.content if isinstance(raw.content, str) else str(raw.content)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        return {"raw": raw, "parsed": None, "parsing_error": e}
+    if model is None:
+        return {"raw": raw, "parsed": data, "parsing_error": None}
+    try:
+        return {"raw": raw, "parsed": model.model_validate(data), "parsing_error": None}
+    except ValidationError as e:
+        return {"raw": raw, "parsed": None, "parsing_error": e}
+
 
 def _normalise_stringified_json(value: Any, annotation: Any) -> Any:
     """Walk ``value`` against ``annotation``; re-parse stringified-JSON

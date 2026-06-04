@@ -1,8 +1,9 @@
-"""LangChain ``parsing_error`` semantics on both extract paths.
+"""Parse-failure semantics on both extract paths.
 
-``with_structured_output(include_raw=True)`` returns
-``{"raw": AIMessage, "parsed": ..., "parsing_error": ...}``. Stitcher's
-handling depends on which call hit the error:
+Stitcher binds the schema directly and self-parses the model's JSON content
+(``_parse_content``): a JSON-decode failure (initial) or a failure to
+validate into ``JsonPatchResponse`` (patch) surfaces as ``parsing_error``.
+Stitcher's handling depends on which call hit the error:
 
 - **Initial extract** (``ainvoke`` only \u2014 ``aupdate`` never enters this
   branch): treated as a hard failure of the seed. Symmetric with a
@@ -18,8 +19,8 @@ handling depends on which call hit the error:
   shape"), consuming an attempt. The malformed AIMessage stays on
   ``raw_messages`` so the caller can see what the model emitted.
 
-These tests script the include_raw envelope explicitly (with
-``parsing_error`` set) to exercise both paths.
+These tests script an ``AIMessage`` with non-JSON ``content`` to drive the
+parse failure on both paths.
 """
 from __future__ import annotations
 
@@ -45,13 +46,10 @@ class Person(BaseModel):
         return self
 
 
-def _parse_error_envelope(content: str = "garbage") -> dict:
-    """Build an include_raw envelope mimicking LangChain's parsing_error path."""
-    return {
-        "raw": AIMessage(content=content),
-        "parsed": None,
-        "parsing_error": ValueError(f"Could not parse: {content!r}"),
-    }
+def _parse_error_envelope(content: str = "garbage") -> AIMessage:
+    """An ``AIMessage`` whose non-JSON ``content`` makes stitcher's
+    ``_parse_content`` raise on ``json.loads`` — the parse-failure path."""
+    return AIMessage(content=content)
 
 
 async def test_initial_parse_error_triggers_re_extract(fake_llm):

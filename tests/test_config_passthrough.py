@@ -43,15 +43,15 @@ async def test_tags_forwarded_to_initial_and_patch_turns(fake_llm):
 
     await extractor.ainvoke([], tags=["batch_42", "experiment_x"])
 
-    # User tags reach both child calls. Stitcher adds ``langsmith:hidden`` to
-    # the include_raw plumbing for Langfuse-trace-noise reduction (see
-    # ``Extractor.__init__``); user tags merge alongside it.
+    # User tags reach both child calls verbatim. Stitcher no longer injects
+    # any tags of its own (the ``langsmith:hidden`` trace hack is gone now
+    # that each LLM call is a single, visible generation span).
     initial_tags = fake_llm.initial_runnable.calls[0]["config"]["tags"]
     patch_tags = fake_llm.patch_runnable.calls[0]["config"]["tags"]
-    assert {"batch_42", "experiment_x"} <= set(initial_tags)
-    assert {"batch_42", "experiment_x"} <= set(patch_tags)
-    assert "langsmith:hidden" in initial_tags
-    assert "langsmith:hidden" in patch_tags
+    assert initial_tags == ["batch_42", "experiment_x"]
+    assert patch_tags == ["batch_42", "experiment_x"]
+    assert "langsmith:hidden" not in initial_tags
+    assert "langsmith:hidden" not in patch_tags
 
 
 async def test_metadata_forwarded_to_initial_and_patch_turns(fake_llm):
@@ -106,10 +106,8 @@ async def test_run_name_on_parent_children_named_initial_and_patch(fake_llm, cap
     patch_cfg = fake_llm.patch_runnable.calls[0]["config"]
     assert initial_cfg["run_name"] == "initial"
     assert patch_cfg["run_name"] == "patch"
-    # User tags reach both, plus stitcher's ``langsmith:hidden`` for trace-noise reduction
-    assert "alpha" in initial_cfg["tags"] and "alpha" in patch_cfg["tags"]
-    assert "langsmith:hidden" in initial_cfg["tags"]
-    assert "langsmith:hidden" in patch_cfg["tags"]
+    # User tags reach both verbatim; stitcher injects none of its own.
+    assert initial_cfg["tags"] == ["alpha"] == patch_cfg["tags"]
     assert initial_cfg["metadata"] == {"k": "v"} == patch_cfg["metadata"]
 
 
@@ -129,8 +127,7 @@ async def test_aupdate_also_forwards_config(fake_llm):
     )
 
     cfg = fake_llm.patch_runnable.calls[0]["config"]
-    assert "update_flow" in cfg["tags"]
-    assert "langsmith:hidden" in cfg["tags"]
+    assert cfg["tags"] == ["update_flow"]
     assert cfg["metadata"] == {"actor": "system"}
 
 
