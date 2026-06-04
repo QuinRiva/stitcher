@@ -850,7 +850,7 @@ def _parse_content(
     a model-validation failure both surface as ``parsing_error`` — folded into
     the patch loop exactly like LangChain's old ``parsing_error``.
     """
-    text = raw.content if isinstance(raw.content, str) else str(raw.content)
+    text = _content_text(raw.content)
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError) as e:
@@ -861,6 +861,27 @@ def _parse_content(
         return {"raw": raw, "parsed": model.model_validate(data), "parsing_error": None}
     except ValidationError as e:
         return {"raw": raw, "parsed": None, "parsing_error": e}
+
+
+def _content_text(content: Any) -> str:
+    """Extract the JSON text payload from an ``AIMessage.content``.
+
+    Plain-string content is returned as-is. Thinking models (Gemini 3,
+    Claude extended thinking, OpenAI o-series via LangChain) return ``content``
+    as a list of blocks — e.g. ``[{"type": "thinking", ...}, {"type": "text",
+    "text": "<the JSON>"}]``. The structured-output payload lives in the
+    ``text`` block(s), never the thinking block, so we concatenate the text of
+    every ``type == "text"`` block and ignore the rest. (LangChain's
+    ``with_structured_output`` parser did this for us; self-parsing means we
+    do it here.)
+    """
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
 
 
 def _normalise_stringified_json(value: Any, annotation: Any) -> Any:
