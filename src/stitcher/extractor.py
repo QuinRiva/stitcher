@@ -315,12 +315,16 @@ _PATCH_PROMPT_TEMPLATE = (
 
 # Prepended to the body when stitcher owns the *what* — i.e. when the
 # trigger is an internal validator failure rather than a user-supplied intent.
+#
+# The errors block is deliberately NOT fenced: consumers author validator
+# messages as markdown (bold headers, code-spans, bullets) meant to render
+# in Langfuse-style trace viewers. A fence would show them as literal text.
 _PATCH_REPAIR_PREFIX = (
     "## Validation Errors\n\n"
     "The previous JSON output failed validation. The errors below are "
     "symptoms — diagnose what your previous output got wrong, then patch "
     "the root cause, not just the surface message.\n\n"
-    "```\n{errors}\n```\n\n"
+    "{errors}\n\n"
     "---\n\n"
 )
 
@@ -1122,6 +1126,10 @@ def _format_validation_errors(errs: list[dict[str, Any]]) -> str:
     Each error gets a one-line header (index, JSON Pointer path, Pydantic
     error type) followed by the message verbatim. Errors are separated by
     a blank line.
+
+    Pydantic prefixes ``ValueError``-raised messages with ``"Value error, "``;
+    the header already carries the error type, so that prefix is stripped
+    to avoid double-prefix noise.
     """
     if not errs:
         return "(no specific errors reported)"
@@ -1129,7 +1137,7 @@ def _format_validation_errors(errs: list[dict[str, Any]]) -> str:
     for i, err in enumerate(errs, 1):
         path = _loc_to_json_pointer(tuple(err.get("loc", ())))
         err_type = err.get("type", "")
-        msg = err.get("msg", "")
+        msg = err.get("msg", "").removeprefix("Value error, ")
         header = f"[{i}] path {path or '(root)'} \u2014 {err_type}:"
         blocks.append(f"{header}\n{msg}")
     return "\n\n".join(blocks)
