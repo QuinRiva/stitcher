@@ -40,7 +40,12 @@ from typing import Any, Callable, TypeAlias, Union, get_args, get_origin
 
 import jsonpatch
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    convert_to_messages,
+)
 from langchain_core.runnables import RunnableLambda
 from pydantic import (
     BaseModel,
@@ -101,7 +106,10 @@ class AttemptInfo(BaseModel):
         if e is None:
             return None
         if isinstance(e, ValidationError):
-            return {"type": "ValidationError", "errors": e.errors()}
+            # e.errors() can carry live exception objects in ctx (e.g. a nested
+            # AggregatedValidationError), which breaks json.dumps downstream;
+            # e.json() is pydantic's JSON-safe projection of the same list.
+            return {"type": "ValidationError", "errors": json.loads(e.json())}
         return {"type": type(e).__name__, "message": str(e)}
 
 
@@ -619,6 +627,10 @@ class Extractor:
         patch_config: dict[str, Any] = {"run_name": "patch"}
 
         t_start = time.monotonic()
+        # Accept LangChain chat-dicts ({"role": ..., "content": ...}) as well as
+        # BaseMessage instances — normalised here so ``Result.raw_messages``
+        # (a validated ``list[BaseMessage]``) holds real message objects.
+        original_messages = convert_to_messages(original_messages)
         raw_messages: list[BaseMessage] = list(original_messages)
         happy_path_messages: list[AIMessage] = []
         attempts = 0
@@ -683,18 +695,6 @@ class Extractor:
             prev_dict = _normalise_stringified_json(prev_dict, self.schema)
             try:
                 value = self.schema.model_validate(prev_dict, context=ctx)
-                await self._fire_attempt(attempts, prev_dict, None)
-                return Result(
-                    value=value,
-                    attempts=attempts,
-                    was_re_extracted=was_re_extracted,
-                    raw_messages=raw_messages,
-                    metadata=_build_metadata(
-                        happy=happy_path_messages,
-                        all_messages=raw_messages,
-                        t_start=t_start,
-                    ),
-                )
             except ValidationError as e:
                 last_validation_error = e
                 await self._fire_attempt(attempts, prev_dict, e)
@@ -719,6 +719,22 @@ class Extractor:
                     happy_path_messages = []
                     prev_dict = None
                 continue
+
+            # Result construction sits OUTSIDE the try above so a bug in
+            # stitcher's own envelope can never masquerade as a schema
+            # validation failure and silently burn patch rounds.
+            await self._fire_attempt(attempts, prev_dict, None)
+            return Result(
+                value=value,
+                attempts=attempts,
+                was_re_extracted=was_re_extracted,
+                raw_messages=raw_messages,
+                metadata=_build_metadata(
+                    happy=happy_path_messages,
+                    all_messages=raw_messages,
+                    t_start=t_start,
+                ),
+            )
 
         raise RuntimeError(
             f"Extractor exhausted {self.max_attempts} attempts. "
