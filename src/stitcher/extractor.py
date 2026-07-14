@@ -851,7 +851,11 @@ class Extractor:
         except (jsonpatch.JsonPatchException, jsonpatch.JsonPointerException) as e:
             return prev_dict, ValueError(
                 f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
-                "Re-issue a corrected patch against the previous JSON output."
+                "Array indices are positional and shift after every removal, so "
+                "a path from an earlier turn may now point elsewhere. Re-derive "
+                "every path against the previous JSON output shown above (not "
+                "indices quoted in an earlier error), and order multiple removals "
+                "on the same list highest-index-first."
             ), None
 
 def _parse_content(
