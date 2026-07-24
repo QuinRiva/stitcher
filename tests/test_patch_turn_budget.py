@@ -79,10 +79,14 @@ def test_apply_retry_then_success_is_one_outer_turn():
     assert new_dict == {"scope": [{"x": 1}]}
     assert applied is not None
     assert len(fake.calls) == 2
-    # The retry prompt carried the shape-enriched apply feedback.
+    # The retry prompt carried the shape-enriched apply feedback, framed as
+    # a patch-mechanics failure — NOT as a validation failure (that framing
+    # would point the model at the wrong artefact: its content, not its paths).
     retry_prompt = fake.calls[1][-1].content
     assert "could not be applied" in retry_prompt
     assert "NONE_IN_SCOPE" in retry_prompt
+    assert "## Patch Application Error" in retry_prompt
+    assert "failed validation" not in retry_prompt
 
 
 def test_apply_failures_capped_and_do_not_loop_forever():

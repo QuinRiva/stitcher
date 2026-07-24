@@ -350,6 +350,34 @@ _PATCH_REPAIR_PREFIX = (
 )
 
 
+# Prepended instead of the validation prefix when the trigger is a JSON-Patch
+# APPLY failure. Framing an apply failure as "failed validation … diagnose what
+# your previous output got wrong" points the model at the wrong artefact: its
+# content may be fine; its patch *paths* were wrong. This prefix names the real
+# category so the model fixes mechanics, not content.
+_PATCH_APPLY_PREFIX = (
+    "## Patch Application Error\n\n"
+    "Your previous JSON Patch could not be applied, so the document is "
+    "UNCHANGED and has not been re-validated. This is a mechanical failure "
+    "\u2014 a patch path that does not resolve against the document's actual "
+    "current state \u2014 not a judgement on your content. Fix the paths; keep "
+    "what you were trying to express.\n\n"
+    "{errors}\n\n"
+    "---\n\n"
+)
+
+
+class PatchApplyError(ValueError):
+    """A JSON Patch that failed to APPLY (as opposed to a validation failure).
+
+    Its own type so ``_build_patch_prompt`` frames it as a patch-mechanics
+    problem rather than wrapping it in the validation-failure prefix, and so
+    ``on_attempt`` consumers can isinstance-discriminate apply failures from
+    semantic ones. Still a ``ValueError``, so existing consumers that catch or
+    classify on that keep working.
+    """
+
+
 class Extractor:
     """Single-schema, JSON-mode + JSON-Patch-repair extractor.
 
@@ -1174,7 +1202,9 @@ def _build_patch_prompt(
 ) -> str:
     """Build the patch-turn prompt.
 
-    With ``error`` set, prepends the validator-failure prefix — stitcher
+    With ``error`` set, prepends the validator-failure prefix (or, for a
+    ``PatchApplyError``, the patch-mechanics prefix — an apply failure is
+    not a validation failure and must not be framed as one) — stitcher
     owns the *what* (the validation errors). With ``error=None``, body only
     — the *what* is in the caller's messages (aupdate's first turn).
 
@@ -1195,7 +1225,12 @@ def _build_patch_prompt(
         errors_text = _format_validation_errors(error.errors())
     else:
         errors_text = str(error)
-    return _PATCH_REPAIR_PREFIX.format(errors=errors_text) + body
+    prefix = (
+        _PATCH_APPLY_PREFIX
+        if isinstance(error, PatchApplyError)
+        else _PATCH_REPAIR_PREFIX
+    )
+    return prefix.format(errors=errors_text) + body
 
 
 def _loc_to_json_pointer(loc: tuple[str | int, ...]) -> str:
@@ -1267,7 +1302,7 @@ def _format_validation_errors(errs: list[dict[str, Any]]) -> str:
 
 def _apply_failure_feedback(
     doc: dict[str, Any], ops: list[Any], exc: BaseException
-) -> ValueError:
+) -> PatchApplyError:
     """Build a shape-enriched apply-failure error for the next patch turn.
 
     Locates the operation that could not be applied AND the document state
@@ -1276,7 +1311,12 @@ def _apply_failure_feedback(
     transformed state, not the original). Resolves the deepest part of the
     relevant pointer(s) that exists in THAT state and renders the current
     value/shape there, so the model can retarget instead of re-issuing the
-    same doomed op. Markdown, Langfuse-readable.
+    same doomed op.
+
+    The closing guidance is CONDITIONAL on what actually went wrong (descent
+    stopped at a scalar; an empty list; multiple removals from one list) so
+    irrelevant advice never dilutes the actionable signal. Markdown,
+    Langfuse-readable.
     """
     state_before, failing_op, applied_before = _find_failing_op(doc, ops)
 
@@ -1288,14 +1328,50 @@ def _apply_failure_feedback(
         pointers = _failure_pointers(failing_op, state_before)
 
     shape_blocks = []
+    scalar_hit = empty_list_hit = False
     for pointer in pointers:
-        resolved, value = _nearest_existing(state_before, _pointer_parts(pointer))
+        parts = _pointer_parts(pointer)
+        resolved, value = _nearest_existing(state_before, parts)
+        stopped_short = len(_pointer_parts(resolved)) < len(parts)
+        scalar_hit |= stopped_short and not isinstance(value, (dict, list))
+        empty_list_hit |= stopped_short and value == []
         label = _pointer_label(failing_op, pointer)
         shape_blocks.append(
             f"The deepest part of {label} `{pointer or '/'}` that currently "
             f"exists is `{resolved or '/'}`, whose current value is:\n\n"
             f"{_describe_shape(value)}"
         )
+
+    op_dicts = [o if isinstance(o, dict) else o.model_dump() for o in ops]
+    remove_parents = [
+        o.get("path", "").rsplit("/", 1)[0]
+        for o in op_dicts
+        if o.get("op") == "remove"
+    ]
+    guidance = [
+        line
+        for fires, line in (
+            (
+                scalar_hit,
+                "- The current value shown above is a scalar, not a container: "
+                "it has no elements to index or append to. Target the field "
+                "itself — `replace` it wholesale with a correctly-shaped value "
+                "(the Target Schema below shows what it may hold).",
+            ),
+            (
+                empty_list_hit,
+                "- An empty list `[]` has no indices to address. Use `/-` to "
+                "append, or `replace` the whole field.",
+            ),
+            (
+                len(remove_parents) > len(set(remove_parents)),
+                "- You are removing several items from one list: order the "
+                "removals highest-index-first so earlier removals do not "
+                "shift the indices of later ones.",
+            ),
+        )
+        if fires
+    ]
 
     provenance = (
         " This reflects the state AFTER your earlier operation(s) in this same "
@@ -1304,18 +1380,14 @@ def _apply_failure_feedback(
         if applied_before
         else ""
     )
-    return ValueError(
+    return PatchApplyError(
         "\n### Your JSON Patch could not be applied\n\n"
         f"{type(exc).__name__}: {exc}\n\n"
         f"The operation that failed was {op_desc}.{provenance}\n\n"
         + "\n\n".join(shape_blocks)
         + "\n\nRe-derive your patch paths from THIS shape (shown above and in "
-        "the previous JSON output), not from paths quoted in an earlier error. "
-        "Note that a scope field holding `\"NONE_IN_SCOPE\"` (or an empty list) "
-        "is empty and has no elements to index or append to — target the field "
-        "itself, not an element within it. List indices are positional; when "
-        "removing several items from one list, order the removals "
-        "highest-index-first so earlier removals do not shift later indices."
+        "the previous JSON output), not from paths quoted in an earlier error."
+        + ("\n\n" + "\n".join(guidance) if guidance else "")
     )
 
 

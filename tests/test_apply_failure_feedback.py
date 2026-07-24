@@ -91,6 +91,37 @@ def test_feedback_surfaces_sentinel_collapse():
     assert "could not be applied" in fb
     assert "`/scope`" in fb
     assert "NONE_IN_SCOPE" in fb  # current shape shown so the retry is informed
+    # Descent stopped at a scalar → the scalar guidance fires (generically —
+    # no schema-specific sentinel vocabulary in a library error message).
+    assert "scalar, not a container" in fb
+
+
+def test_guidance_is_conditional():
+    # An out-of-range index on a healthy list: neither the scalar nor the
+    # multi-remove advice applies, so neither may appear — irrelevant advice
+    # dilutes the actionable signal.
+    doc = {"items": [1, 2]}
+    ops = [{"op": "replace", "path": "/items/9", "value": 3}]
+    fb = _feedback(doc, ops)
+    assert "scalar, not a container" not in fb
+    assert "highest-index-first" not in fb
+
+
+def test_multi_remove_guidance_fires_for_same_list():
+    doc = {"items": [1, 2, 3]}
+    ops = [
+        {"op": "remove", "path": "/items/0"},
+        {"op": "remove", "path": "/items/5"},
+    ]
+    fb = _feedback(doc, ops)
+    assert "highest-index-first" in fb
+
+
+def test_empty_list_guidance_fires():
+    doc = {"xs": []}
+    ops = [{"op": "replace", "path": "/xs/0", "value": 1}]
+    fb = _feedback(doc, ops)
+    assert "An empty list `[]` has no indices" in fb
 
 
 def test_describe_shape_truncation_uses_plain_fence():
