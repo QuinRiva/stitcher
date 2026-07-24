@@ -62,6 +62,19 @@ from stitcher.exceptions import AggregatedValidationError
 ValidationContext: TypeAlias = dict[str, Any]
 
 
+# Apply failures get their own budget, separate from the validation-attempt
+# budget. Small by design: a pointer that will not resolve after a shape-
+# informed retry or two is not going to resolve on the fifth. Keeping it tight
+# preserves LLM calls while still giving the model a couple of shape-informed
+# chances within one outer attempt.
+_MAX_APPLY_ATTEMPTS = 3
+
+# Cap the current-shape blob fed back so a large document cannot bloat the
+# repair prompt; the model needs the shape at the failing location, not the
+# whole tree.
+_SHAPE_CHAR_BUDGET = 800
+
+
 class AttemptInfo(BaseModel):
     """Per-attempt observability payload, fired by ``Extractor.on_attempt``.
 
@@ -337,6 +350,34 @@ _PATCH_REPAIR_PREFIX = (
 )
 
 
+# Prepended instead of the validation prefix when the trigger is a JSON-Patch
+# APPLY failure. Framing an apply failure as "failed validation … diagnose what
+# your previous output got wrong" points the model at the wrong artefact: its
+# content may be fine; its patch *paths* were wrong. This prefix names the real
+# category so the model fixes mechanics, not content.
+_PATCH_APPLY_PREFIX = (
+    "## Patch Application Error\n\n"
+    "Your previous JSON Patch could not be applied, so the document is "
+    "UNCHANGED and has not been re-validated. This is a mechanical failure "
+    "\u2014 a patch path that does not resolve against the document's actual "
+    "current state \u2014 not a judgement on your content. Fix the paths; keep "
+    "what you were trying to express.\n\n"
+    "{errors}\n\n"
+    "---\n\n"
+)
+
+
+class PatchApplyError(ValueError):
+    """A JSON Patch that failed to APPLY (as opposed to a validation failure).
+
+    Its own type so ``_build_patch_prompt`` frames it as a patch-mechanics
+    problem rather than wrapping it in the validation-failure prefix, and so
+    ``on_attempt`` consumers can isinstance-discriminate apply failures from
+    semantic ones. Still a ``ValueError``, so existing consumers that catch or
+    classify on that keep working.
+    """
+
+
 class Extractor:
     """Single-schema, JSON-mode + JSON-Patch-repair extractor.
 
@@ -502,6 +543,7 @@ class Extractor:
         *,
         validation_context: ValidationContext | None = None,
         run_name: str | None = None,
+        initial_error: BaseException | None = None,
         **config: Any,
     ) -> Result:
         """Apply an update intent to an existing instance.
@@ -527,6 +569,18 @@ class Extractor:
             validation_context: as for ``ainvoke``.
             run_name: as for ``ainvoke``; only the ``.patch`` suffix is used
                 (no initial extract in update mode).
+            initial_error: optional per-call error that seeds the FIRST patch
+                turn's prompt via the same ``## Validation Errors`` framing a
+                validator failure would produce. ``aupdate`` seeds the loop
+                with an existing document, so without this the first patch
+                turn carries no validator header — the *what* is expected to
+                come through ``messages``. Handing the initial adjudication
+                failure here delivers it through the per-turn patch channel
+                instead, which is rebuilt — and so naturally REPLACED by the
+                real current error — every subsequent turn. It never touches
+                the system channel / ``original_messages``, so validation state
+                cannot accumulate stale there. With ``initial_error=None`` the
+                first patch prompt is byte-identical to today's headerless one.
             **config: as for ``ainvoke`` — forwarded to LangChain's
                 ``RunnableConfig`` on every patch turn.
 
@@ -555,6 +609,7 @@ class Extractor:
                 prev_dict=prev_dict,
                 validation_context=validation_context,
                 allow_re_extract=False,
+                initial_error=initial_error,
             )
 
         parent_config: dict[str, Any] = {
@@ -570,6 +625,7 @@ class Extractor:
         prev_dict: dict[str, Any] | None,
         validation_context: ValidationContext | None,
         allow_re_extract: bool,
+        initial_error: BaseException | None = None,
     ) -> Result:
         """Shared validate-and-patch loop for ``ainvoke`` and ``aupdate``.
 
@@ -588,6 +644,14 @@ class Extractor:
           the user's messages own the *what* (``aupdate``'s first turn).
         - ``prev_dict`` set, ``last_error`` set → repair patch turn; the
           validator-failure prefix is prepended to the patch prompt.
+
+        ``initial_error`` (``aupdate`` only) seeds ``last_validation_error``
+        before the loop, so the FIRST patch turn is a repair turn carrying the
+        ``## Validation Errors`` framing around that error instead of a
+        headerless turn. It is replaced by the real current error every turn
+        after (the loop already rewrites ``last_validation_error`` each pass),
+        so nothing accumulates. With ``initial_error=None`` the first turn is
+        headerless exactly as before.
 
         ``allow_re_extract`` gates the catastrophic-re-extract path — only
         ``ainvoke`` enables it because only ``ainvoke`` has a fresh-extract
@@ -635,7 +699,10 @@ class Extractor:
         happy_path_messages: list[AIMessage] = []
         attempts = 0
         was_re_extracted = False
-        last_validation_error: BaseException | None = None
+        # Seeded from initial_error (aupdate) so the first patch turn carries
+        # its ## Validation Errors framing; None for ainvoke (headerless first
+        # turn / initial extract). Replaced by the real current error each pass.
+        last_validation_error: BaseException | None = initial_error
 
         while attempts < self.max_attempts:
             attempts += 1
@@ -802,61 +869,98 @@ class Extractor:
         # patch_config carries only run_name ("patch") — callbacks, tags,
         # metadata, and parent_run_id come from the surrounding RunnableLambda
         # context set up by ainvoke/aupdate.
-        """One patch turn: build the request, call the model, apply the patch.
+        """One outer patch turn, with an inner shape-informed apply-retry loop.
 
         Returns ``(new_prev_dict, error, applied_message)``:
 
         - ``error is None``: patch applied. ``new_prev_dict`` is the patched
           dict; ``applied_message`` is the model's real ``AIMessage`` (now on
           the happy path — its output is reflected in the patched state).
-        - ``error`` set: patch could not be applied, either because the model
-          returned a ``parsing_error`` (response didn't match the
-          ``{reasoning, operations}`` shape) or because ``jsonpatch.apply``
-          rejected the ops (bad pointer, malformed op). ``new_prev_dict`` is
-          the *unchanged* input; ``applied_message`` is ``None`` (the message
-          is still on ``raw_messages`` for debugging, just not on the happy
-          path). The caller feeds ``error`` back as the next turn's
-          validation trigger.
+        - ``error`` set: the patch could not be applied, either because the
+          model returned a ``parsing_error`` (response didn't match the
+          ``{reasoning, operations}`` shape) or because the apply-retry cap
+          ``_MAX_APPLY_ATTEMPTS`` was exhausted. ``new_prev_dict`` is the
+          *unchanged* input; ``applied_message`` is ``None`` (the messages are
+          still on ``raw_messages`` for debugging, just not on the happy path).
+          The caller feeds ``error`` back as the next turn's validation trigger
+          and consumes exactly one validation attempt.
+
+        Apply-failure hardening (see the module functions ``_apply_failure_``
+        ``feedback`` etc.): a patch that fails to *apply* is retried in place
+        with a shape-enriched prompt — the current value at the deepest
+        existing ancestor of the failing pointer — up to ``_MAX_APPLY_ATTEMPTS``
+        times *within this single outer turn*. Those inner retries do NOT
+        consume a validation attempt; only inner-cap exhaustion (or a non-apply
+        parse error) propagates an error to the outer loop. A purely mechanical
+        pointer error therefore can no longer exhaust the semantic-repair
+        budget.
+
+        Termination: the outer ``_patch_loop`` bounds total outer attempts at
+        ``max_attempts``; each outer attempt runs at most ``_MAX_APPLY_ATTEMPTS``
+        patch generations here, so total LLM calls are bounded by
+        ``max_attempts * _MAX_APPLY_ATTEMPTS`` (e.g. a caller with
+        ``max_attempts=7`` bounds worst-case patch generations at 21) and the
+        loop always terminates.
+
+        ``on_attempt`` semantics: inner apply retries are sub-attempts and do
+        NOT fire ``on_attempt`` — only the outer-attempt outcome (applied then
+        validated, or inner-cap exhaustion) fires it once from the outer loop.
 
         Mutates ``raw_messages`` in place: appends the outgoing
-        ``HumanMessage`` and the model's ``AIMessage`` (whether the call
-        succeeded or hit a ``parsing_error``).
+        ``HumanMessage`` and the model's ``AIMessage`` for every inner attempt
+        (whether the call succeeded, hit a ``parsing_error``, or failed to
+        apply).
         """
-        patch_msg = HumanMessage(content=patch_prompt)
-        patch_history = list(original_messages) + [
-            AIMessage(content=json.dumps(prev_dict)),
-            patch_msg,
-        ]
-        raw_messages.append(patch_msg)
-        patch_result = await self._invoke_patch(patch_history, patch_config)
-        patch_raw: AIMessage = patch_result["raw"]
-        raw_messages.append(patch_raw)
-        parse_error = patch_result["parsing_error"]
-        if parse_error is not None:
-            # The model returned something that didn't match JsonPatchResponse
-            # (missing operations, wrong types, prose instead of JSON, ...).
-            # Symmetric with a jsonpatch-apply failure: feed back, consume an
-            # attempt, let the model retry the patch protocol.
-            return prev_dict, ValueError(
-                f"Your response did not match the required "
-                f"{{reasoning, operations}} shape: "
-                f"{type(parse_error).__name__}: {parse_error}. "
-                "Reissue with both fields populated."
-            ), None
-        patch_resp: JsonPatchResponse = patch_result["parsed"]
-        ops = patch_resp.operations
-        try:
-            new_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
-            return new_dict, None, patch_raw
-        except (jsonpatch.JsonPatchException, jsonpatch.JsonPointerException) as e:
-            return prev_dict, ValueError(
-                f"Your JSON Patch could not be applied: {type(e).__name__}: {e}. "
-                "Array indices are positional and shift after every removal, so "
-                "a path from an earlier turn may now point elsewhere. Re-derive "
-                "every path against the previous JSON output shown above (not "
-                "indices quoted in an earlier error), and order multiple removals "
-                "on the same list highest-index-first."
-            ), None
+        current_prompt = patch_prompt
+        for apply_attempt in range(_MAX_APPLY_ATTEMPTS):
+            patch_msg = HumanMessage(content=current_prompt)
+            patch_history = list(original_messages) + [
+                AIMessage(content=json.dumps(prev_dict)),
+                patch_msg,
+            ]
+            raw_messages.append(patch_msg)
+            patch_result = await self._invoke_patch(patch_history, patch_config)
+            patch_raw: AIMessage = patch_result["raw"]
+            raw_messages.append(patch_raw)
+
+            parse_error = patch_result["parsing_error"]
+            if parse_error is not None:
+                # The model returned something that didn't match
+                # JsonPatchResponse (missing operations, wrong types, prose
+                # instead of JSON, ...). This is a protocol error, not an apply
+                # failure — hand it straight back to the outer loop (no apply
+                # retry), consuming one attempt.
+                return prev_dict, ValueError(
+                    f"Your response did not match the required "
+                    f"{{reasoning, operations}} shape: "
+                    f"{type(parse_error).__name__}: {parse_error}. "
+                    "Reissue with both fields populated."
+                ), None
+
+            ops = patch_result["parsed"].operations
+            try:
+                new_dict = jsonpatch.JsonPatch(ops).apply(prev_dict)
+                return new_dict, None, patch_raw
+            except (
+                jsonpatch.JsonPatchException,
+                jsonpatch.JsonPointerException,
+            ) as exc:
+                feedback = _apply_failure_feedback(prev_dict, ops, exc)
+                if apply_attempt < _MAX_APPLY_ATTEMPTS - 1:
+                    # Retry within this outer attempt: rebuild the patch prompt
+                    # around the shape-enriched apply error. Does NOT consume a
+                    # validation attempt.
+                    current_prompt = _build_patch_prompt(
+                        feedback, self._schema_json
+                    )
+                    continue
+                # Apply budget exhausted for this outer attempt: hand the
+                # shape-enriched error back to the outer loop (consumes exactly
+                # one validation attempt), which keeps overall termination.
+                return prev_dict, feedback, None
+
+        # Unreachable: the loop always returns. Present for type-checkers.
+        raise AssertionError("apply-retry loop exited without returning")
 
 def _parse_content(
     raw: AIMessage, model: type[BaseModel] | None
@@ -1098,7 +1202,9 @@ def _build_patch_prompt(
 ) -> str:
     """Build the patch-turn prompt.
 
-    With ``error`` set, prepends the validator-failure prefix — stitcher
+    With ``error`` set, prepends the validator-failure prefix (or, for a
+    ``PatchApplyError``, the patch-mechanics prefix — an apply failure is
+    not a validation failure and must not be framed as one) — stitcher
     owns the *what* (the validation errors). With ``error=None``, body only
     — the *what* is in the caller's messages (aupdate's first turn).
 
@@ -1119,7 +1225,12 @@ def _build_patch_prompt(
         errors_text = _format_validation_errors(error.errors())
     else:
         errors_text = str(error)
-    return _PATCH_REPAIR_PREFIX.format(errors=errors_text) + body
+    prefix = (
+        _PATCH_APPLY_PREFIX
+        if isinstance(error, PatchApplyError)
+        else _PATCH_REPAIR_PREFIX
+    )
+    return prefix.format(errors=errors_text) + body
 
 
 def _loc_to_json_pointer(loc: tuple[str | int, ...]) -> str:
@@ -1136,28 +1247,290 @@ def _loc_to_json_pointer(loc: tuple[str | int, ...]) -> str:
 
 
 def _format_validation_errors(errs: list[dict[str, Any]]) -> str:
-    """Render Pydantic ``ValidationError.errors()`` as a readable text block.
+    """Render ``ValidationError.errors()``, rolling identical error classes up.
 
-    Replaces the previous ``json.dumps(errors)`` rendering, which escaped
-    every ``\\n`` in user-supplied validator messages into literal ``\\n``
-    text — turning multi-line messages (markdown, examples, hints) into
-    unreadable single-line walls. Real newlines are preserved here.
+    Pydantic emits one entry per error, so when the SAME validator fires on
+    many list items — e.g. a presence check on seven ``/entities/N`` — its full
+    multi-line explanation is repeated verbatim once per occurrence, burying
+    the only per-occurrence signal (the paths) and wasting repair-prompt
+    tokens.
 
-    Each error gets a one-line header (index, JSON Pointer path, Pydantic
-    error type) followed by the message verbatim. Errors are separated by
-    a blank line.
+    Errors sharing an identical ``(type, message)`` are grouped: the
+    explanation is shown ONCE — the validator's own prose kept verbatim, so the
+    schema stays the single source of truth — followed by a concise list of
+    every JSON-Pointer path it occurs at. A lone error keeps its full prose
+    with its path inline. Only byte-identical messages merge, so any
+    per-occurrence variance (a differing interpolated value) keeps its own
+    block and no information is lost. First-seen order is preserved.
 
-    Pydantic prefixes ``ValueError``-raised messages with ``"Value error, "``;
-    the header already carries the error type, so that prefix is stripped
-    to avoid double-prefix noise.
+    Markdown throughout (bold, inline-code paths, the validators' own ``###``
+    headings) so it renders in Langfuse-style trace viewers. The Pydantic
+    ``"Value error, "`` prefix is stripped and a blank line precedes each
+    message, so a leading ``###`` heading renders as a heading instead of
+    leaking as literal text. This preserves the previous renderer's contract
+    for single errors (real newlines, JSON-Pointer paths, bracket numbering)
+    while collapsing repeated classes.
     """
     if not errs:
         return "(no specific errors reported)"
+    groups: dict[tuple[str, str], list[str]] = {}
+    for err in errs:
+        path = _loc_to_json_pointer(tuple(err.get("loc", ()))) or "(root)"
+        key = (
+            err.get("type", ""),
+            err.get("msg", "").removeprefix("Value error, "),
+        )
+        groups.setdefault(key, []).append(path)
     blocks = []
-    for i, err in enumerate(errs, 1):
-        path = _loc_to_json_pointer(tuple(err.get("loc", ())))
-        err_type = err.get("type", "")
-        msg = err.get("msg", "").removeprefix("Value error, ")
-        header = f"[{i}] path {path or '(root)'} \u2014 {err_type}:"
-        blocks.append(f"{header}\n{msg}")
+    for i, ((err_type, msg), paths) in enumerate(groups.items(), 1):
+        body = msg.strip()
+        if len(paths) == 1:
+            blocks.append(f"[{i}] {err_type} at `{paths[0]}`\n\n{body}")
+        else:
+            locs = "\n".join(f"- `{p}`" for p in paths)
+            blocks.append(
+                f"[{i}] {err_type} ({len(paths)} occurrences)\n\n{body}\n\n"
+                f"**Occurs at these {len(paths)} paths:**\n{locs}"
+            )
     return "\n\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# JSON-Patch apply-failure feedback (shape-informed repair on an apply error)
+# ---------------------------------------------------------------------------
+
+
+def _apply_failure_feedback(
+    doc: dict[str, Any], ops: list[Any], exc: BaseException
+) -> PatchApplyError:
+    """Build a shape-enriched apply-failure error for the next patch turn.
+
+    Locates the operation that could not be applied AND the document state
+    immediately before it (earlier ops in the same patch have already been
+    applied — JSON-Patch applies sequentially — so the failing op sees that
+    transformed state, not the original). Resolves the deepest part of the
+    relevant pointer(s) that exists in THAT state and renders the current
+    value/shape there, so the model can retarget instead of re-issuing the
+    same doomed op.
+
+    The closing guidance is CONDITIONAL on what actually went wrong (descent
+    stopped at a scalar; an empty list; multiple removals from one list) so
+    irrelevant advice never dilutes the actionable signal. Markdown,
+    Langfuse-readable.
+    """
+    state_before, failing_op, applied_before = _find_failing_op(doc, ops)
+
+    if failing_op is None:
+        op_desc = "one of your operations"
+        pointers = [""]
+    else:
+        op_desc = f"`{failing_op.get('op', '?')}` at `{failing_op.get('path', '')}`"
+        pointers = _failure_pointers(failing_op, state_before)
+
+    shape_blocks = []
+    scalar_hit = empty_list_hit = False
+    for pointer in pointers:
+        parts = _pointer_parts(pointer)
+        resolved, value = _nearest_existing(state_before, parts)
+        stopped_short = len(_pointer_parts(resolved)) < len(parts)
+        scalar_hit |= stopped_short and not isinstance(value, (dict, list))
+        empty_list_hit |= stopped_short and value == []
+        label = _pointer_label(failing_op, pointer)
+        shape_blocks.append(
+            f"The deepest part of {label} `{pointer or '/'}` that currently "
+            f"exists is `{resolved or '/'}`, whose current value is:\n\n"
+            f"{_describe_shape(value)}"
+        )
+
+    op_dicts = [o if isinstance(o, dict) else o.model_dump() for o in ops]
+    remove_parents = [
+        o.get("path", "").rsplit("/", 1)[0]
+        for o in op_dicts
+        if o.get("op") == "remove"
+    ]
+    guidance = [
+        line
+        for fires, line in (
+            (
+                scalar_hit,
+                "- The current value shown above is a scalar, not a container: "
+                "it has no elements to index or append to. Target the field "
+                "itself — `replace` it wholesale with a correctly-shaped value "
+                "(the Target Schema below shows what it may hold).",
+            ),
+            (
+                empty_list_hit,
+                "- An empty list `[]` has no indices to address. Use `/-` to "
+                "append, or `replace` the whole field.",
+            ),
+            (
+                len(remove_parents) > len(set(remove_parents)),
+                "- You are removing several items from one list: order the "
+                "removals highest-index-first so earlier removals do not "
+                "shift the indices of later ones.",
+            ),
+        )
+        if fires
+    ]
+
+    provenance = (
+        " This reflects the state AFTER your earlier operation(s) in this same "
+        "patch were applied (JSON Patch applies operations in order), so a path "
+        "an earlier op removed or re-indexed may no longer exist."
+        if applied_before
+        else ""
+    )
+    return PatchApplyError(
+        "\n### Your JSON Patch could not be applied\n\n"
+        f"{type(exc).__name__}: {exc}\n\n"
+        f"The operation that failed was {op_desc}.{provenance}\n\n"
+        + "\n\n".join(shape_blocks)
+        + "\n\nRe-derive your patch paths from THIS shape (shown above and in "
+        "the previous JSON output), not from paths quoted in an earlier error."
+        + ("\n\n" + "\n".join(guidance) if guidance else "")
+    )
+
+
+def _find_failing_op(
+    doc: dict[str, Any], ops: list[Any]
+) -> tuple[Any, dict[str, Any] | None, bool]:
+    """Locate the first un-appliable op and the doc state it actually saw.
+
+    ``jsonpatch`` applies a patch atomically and does not say *which* op
+    failed. Replaying the ops one at a time against a running copy identifies
+    the culprit precisely AND yields the running state immediately before it
+    (the state that op was applied against). Returns
+    ``(state_before_failure, failing_op, any_ops_applied_first)``.
+    """
+    running = doc
+    applied_before = False
+    for op in ops:
+        op_dict = op if isinstance(op, dict) else op.model_dump()
+        try:
+            running = jsonpatch.JsonPatch([op_dict]).apply(running)
+        except Exception:
+            # Any op that will not replay is the culprit. Broad by design: this
+            # runs only AFTER the atomic apply already failed, purely to build
+            # feedback, so it must never itself raise (some malformed ops map
+            # to TypeError/KeyError rather than a jsonpatch exception).
+            return running, op_dict, applied_before
+        applied_before = True
+    return running, None, applied_before
+
+
+def _failure_pointers(op: dict[str, Any], state: Any) -> list[str]:
+    """The pointer(s) whose shape explains why ``op`` failed against ``state``.
+
+    For move/copy there are two arms: the ``from`` source and the ``path``
+    destination. Disambiguate by resolution — if the source resolves fully the
+    fault is at the destination, otherwise at the source; when neither is
+    clearly at fault, surface both. Every other op is anchored on ``path``.
+    """
+    if op.get("op") in ("move", "copy"):
+        src = op.get("from", "")
+        dst = op.get("path", "")
+        resolved_src, _ = _nearest_existing(state, _pointer_parts(src))
+        if _pointer_parts(src) and resolved_src == _render_pointer(_pointer_parts(src)):
+            return [dst]  # source resolves cleanly → the destination is at fault
+        return [src, dst]
+    return [op.get("path", "")]
+
+
+def _pointer_label(op: dict[str, Any] | None, pointer: str) -> str:
+    """Name a pointer as the source/destination/target for the feedback text."""
+    if op is not None and op.get("op") in ("move", "copy"):
+        if pointer == op.get("from"):
+            return "the source path"
+        if pointer == op.get("path"):
+            return "the destination path"
+    return "that path"
+
+
+def _pointer_parts(pointer: str) -> list[str]:
+    """Decode an RFC 6901 JSON Pointer into its unescaped segments."""
+    if not pointer or pointer == "/":
+        return []
+    return [
+        seg.replace("~1", "/").replace("~0", "~")
+        for seg in pointer.lstrip("/").split("/")
+    ]
+
+
+def _render_pointer(parts: list[str]) -> str:
+    """Render unescaped segments back into an RFC 6901 JSON Pointer.
+
+    Re-escapes ``~`` and ``/`` so a segment that contains either (a filename
+    with a slash, say) produces a valid pointer the model can patch against.
+    """
+    if not parts:
+        return ""
+    return "/" + "/".join(
+        seg.replace("~", "~0").replace("/", "~1") for seg in parts
+    )
+
+
+def _nearest_existing(doc: Any, parts: list[str]) -> tuple[str, Any]:
+    """Descend ``parts`` through ``doc`` as far as they actually resolve.
+
+    Returns ``(pointer, value)`` for the deepest existing ancestor: descent
+    stops at the first segment that cannot be followed (a missing key, an
+    out-of-range or ``-`` list index, or any attempt to index into a scalar —
+    the sentinel-string case). This deliberately does NOT index into strings
+    (RFC-pointer libraries would return a character), because the useful signal
+    is exactly that the field is a scalar where the model expected a container.
+    """
+    cur = doc
+    resolved: list[str] = []
+    for part in parts:
+        if isinstance(cur, dict):
+            if part in cur:
+                cur = cur[part]
+                resolved.append(part)
+                continue
+            break
+        if isinstance(cur, list):
+            if part == "-":
+                break
+            try:
+                idx = int(part)
+            except ValueError:
+                break
+            if idx < 0 or idx >= len(cur):
+                break
+            cur = cur[idx]
+            resolved.append(part)
+            continue
+        break
+    return _render_pointer(resolved), cur
+
+
+def _fenced(text: str) -> str:
+    """Cap ``text`` to the shape budget and wrap it in a code fence.
+
+    A ``json`` fence is used only when the (uncapped) content is genuine JSON;
+    once truncated it is no longer valid JSON, so a plain fence is used to
+    avoid mislabelling prose/partial content as JSON.
+    """
+    if len(text) > _SHAPE_CHAR_BUDGET:
+        return "```\n" + text[:_SHAPE_CHAR_BUDGET] + "\n…(truncated)\n```"
+    return "```json\n" + text + "\n```"
+
+
+def _describe_shape(value: Any) -> str:
+    """Render ``value`` as a budgeted markdown block for the feedback message.
+
+    For a list the model most needs its length (the valid indices), so a
+    one-line prose summary precedes the fenced value — the prose sits OUTSIDE
+    the fence so it is never mislabelled as JSON. Every container's rendered
+    value is capped at ``_SHAPE_CHAR_BUDGET`` so a large document cannot bloat
+    the repair prompt (a 3×10k-element list would otherwise dominate it).
+    """
+    if isinstance(value, list):
+        if not value:
+            return "an empty list `[]`"
+        summary = (
+            f"a list with {len(value)} element(s) "
+            f"(valid indices 0..{len(value) - 1}); value:"
+        )
+        return summary + "\n\n" + _fenced(json.dumps(value, ensure_ascii=False))
+    return _fenced(json.dumps(value, ensure_ascii=False))

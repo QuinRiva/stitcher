@@ -93,14 +93,21 @@ async def test_on_attempt_validation_failure_passes_raw_exception(fake_llm):
 
 
 async def test_on_attempt_fires_for_patch_apply_failure(fake_llm):
-    """Patch couldn't be applied (bad pointer) \u2192 on_attempt fires with parsed=None."""
+    """A patch-apply failure that EXHAUSTS the inner apply cap consumes one
+    outer attempt and fires on_attempt with parsed=None. The inner apply retries
+    are sub-attempts and do NOT fire on_attempt (only the outer outcome does)."""
     seen: list[AttemptInfo] = []
+    bad = JsonPatchResponse(
+        reasoning="(test)",
+        operations=[{"op": "replace", "path": "/nonexistent/field", "value": 1}],
+    )
     fake_llm.set_scripts(
         initial=[{"name": "Dave", "age": -5}],
         patch=[
-            # First patch: pointer doesn't exist \u2192 jsonpatch raises
-            JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/nonexistent/field", "value": 1}]),
-            # Second patch: valid recovery
+            # attempt 2: the apply cap (_MAX_APPLY_ATTEMPTS=3) of bad patches is
+            # exhausted in-turn, consuming exactly one outer attempt.
+            bad, bad, bad,
+            # attempt 3: valid recovery
             JsonPatchResponse(reasoning="(test)", operations=[{"op": "replace", "path": "/age", "value": 25}]),
         ],
     )
@@ -109,7 +116,7 @@ async def test_on_attempt_fires_for_patch_apply_failure(fake_llm):
     result = await extractor.ainvoke([])
 
     assert result.value.age == 25
-    # 3 attempts: initial validate-fail, patch-apply-fail, patch-success
+    # 3 attempts: initial validate-fail, apply-cap-exhaustion, patch-success
     assert [info.attempt_number for info in seen] == [1, 2, 3]
     assert [info.is_success for info in seen] == [False, False, True]
     # Attempt 2 is the patch-apply failure: parsed is None, error is a ValueError
