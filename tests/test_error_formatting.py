@@ -156,5 +156,6 @@ async def test_multiline_validator_message_arrives_with_real_newlines(fake_llm):
     patch_prompt = fake_llm.patch_runnable.calls[0]["input"][-1].content
     # The rendered error preserves real newlines from the validator
     assert "**Multi-line error**\n\nLine two\nLine three" in patch_prompt
-    # And the path is in JSON Pointer form (root because model_validator(mode="after"))
-    assert "[1] path (root)" in patch_prompt
+    # And the path is in JSON Pointer form (root because model_validator(mode="after")),
+    # rendered in the rollup's single-occurrence style.
+    assert "[1] value_error at `(root)`" in patch_prompt

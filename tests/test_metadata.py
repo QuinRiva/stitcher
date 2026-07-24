@@ -190,7 +190,10 @@ async def test_failed_patch_apply_excluded_from_initial_but_in_total(fake_llm):
     extractor = Extractor(fake_llm, Person, max_attempts=5)
     result = await extractor.ainvoke([])
 
-    assert result.attempts == 3
+    # attempt 1: initial validate-fail. attempt 2: the bad patch fails to apply
+    # and is retried IN-TURN by the second (good) patch, which applies and
+    # validates — so the apply failure never consumes its own outer attempt.
+    assert result.attempts == 2
     # initial still tracks the seed extract only
     assert result.metadata.initial.input_tokens == 100
     # total includes both patches (failed and successful)
